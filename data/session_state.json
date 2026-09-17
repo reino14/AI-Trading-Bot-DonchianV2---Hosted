@@ -1,0 +1,12 @@
+{
+  "symbol": "BTC/USDT:USDT",
+  "timeframe": "1m",
+  "session_hours": 24.0,
+  "min_entry_buffer_hours": null,
+  "session_start": "2026-09-17T15:14:31.153210+00:00",
+  "last_update": "2026-09-17T22:43:03.561912+00:00",
+  "current_position": 0,
+  "latest_signal": -1,
+  "latest_price": 76379.8,
+  "latest_bar_time": "2026-09-17T22:42:00+00:00"
+}

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Data mentah bisa diunduh ulang, tidak perlu masuk git
+data/raw/*.parquet
+data/live/*.jsonl
+
+# JANGAN PERNAH commit kredensial
+config/secrets.env
+.env
+*.key
