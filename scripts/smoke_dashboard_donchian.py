@@ -1,18 +1,21 @@
 """
 scripts/smoke_dashboard_donchian.py
 
-Uji asap inti perhitungan dashboard -- terutama yang Nero minta:
-"BERSIH = total trade DIKURANGI fee di Binance". Semua angka di sini
-bisa dihitung tangan, dan bentuk datanya meniru respons ccxt/Binance
-yang sungguhan (fee unified + info.realizedPnl/commission mentah).
+Uji asap dashboard: perbaikan paginasi (bug "cuma tanggal 16"),
+filter tanggal, hitungan channel, dan penyusunan perintah bot.
+Semua dengan bursa PALSU -- tanpa koneksi sungguhan.
 """
 
 import sys
 
 sys.path.insert(0, ".")
-from scripts.dashboard_donchian import aggregate_trades  # noqa: E402
+from scripts.dashboard_donchian import (  # noqa: E402
+    CHUNK_MS, aggregate_trades, build_bot_command, compute_channel,
+    fetch_all_trades, filter_trades_by_time,
+)
 
 FAILURES: list[str] = []
+HARI = 24 * 60 * 60 * 1000
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -22,103 +25,134 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
-def trade(pnl, fee, side="buy", price=100.0, amount=0.01, use_unified_fee=True):
-    """Bentuk trade meniru ccxt: fee unified + info mentah Binance."""
-    t = {
-        "side": side, "price": price, "amount": amount,
+class BursaPalsu:
+    """
+    Meniru perilaku Binance yang menyebabkan bug: mengembalikan trade
+    URUT NAIK dari yang terlama, dibatasi `limit` per permintaan, dan
+    menghormati startTime/endTime.
+    """
+
+    def __init__(self, trades):
+        self.trades = sorted(trades, key=lambda t: t["timestamp"])
+        self.calls = 0
+
+    def fetch_my_trades(self, symbol, since=None, limit=None, params=None):
+        self.calls += 1
+        params = params or {}
+        end = params.get("endTime")
+        hasil = [t for t in self.trades
+                 if (since is None or t["timestamp"] >= since)
+                 and (end is None or t["timestamp"] <= end)]
+        return hasil[: (limit or 1000)]
+
+
+def buat_trade(ts, pnl=0.0, fee=0.01, tid=None):
+    return {
+        "id": tid or f"t{ts}", "timestamp": ts, "order": f"o{ts}",
+        "side": "buy", "price": 100.0, "amount": 0.01,
+        "fee": {"cost": fee, "currency": "USDT"},
         "info": {"realizedPnl": str(pnl), "commission": str(fee)},
     }
-    if use_unified_fee:
-        t["fee"] = {"cost": fee, "currency": "USDT"}
-    return t
 
 
 def main() -> int:
-    print("== 1. BERSIH = total realisasi DIKURANGI fee (inti permintaan Nero) ==")
-    # 3 trade: +10, -4, +6 -> realisasi total = +12
-    # fee: 0.5 + 0.5 + 0.5 = 1.5
-    # BERSIH = 12 - 1.5 = 10.5
-    trades = [trade(10.0, 0.5), trade(-4.0, 0.5), trade(6.0, 0.5)]
-    a = aggregate_trades(trades)
-    check("total_realized = 12.0", abs(a["total_realized"] - 12.0) < 1e-9, f"dapat {a['total_realized']}")
-    check("total_fee = 1.5", abs(a["total_fee"] - 1.5) < 1e-9, f"dapat {a['total_fee']}")
-    check("net = 10.5 (12 - 1.5)", abs(a["net"] - 10.5) < 1e-9, f"dapat {a['net']}")
+    base = 1_789_000_000_000  # titik awal sembarang
 
-    print("\n== 2. Fee BISA lebih besar dari untung -> BERSIH jadi NEGATIF walau realisasi positif ==")
-    # Ini persis kekhawatiran Nero: 'kotor' kelihatan untung, tapi habis kena fee.
-    trades2 = [trade(0.6, 1.2), trade(0.4, 1.2)]  # realisasi +1.0, fee 2.4 -> bersih -1.4
-    a2 = aggregate_trades(trades2)
-    check("total_realized POSITIF (+1.0)", abs(a2["total_realized"] - 1.0) < 1e-9)
-    check("net NEGATIF (-1.4) -- fee mengalahkan untung",
-          abs(a2["net"] - (-1.4)) < 1e-9, f"dapat {a2['net']}")
+    print("== 1. BUG REPRODUKSI: 300 fill di hari-1, 5 fill di hari-2 dan hari-3 ==")
+    # Persis pola Nero: hari pertama PENUH split-fill (ratusan), hari
+    # berikutnya sedikit. Limit per halaman sengaja 200 -- versi LAMA
+    # (sekali panggil limit=200) cuma akan dapat hari-1 saja.
+    trades = [buat_trade(base + i * 1000) for i in range(300)]              # hari-1
+    trades += [buat_trade(base + 1 * HARI + i * 1000, pnl=5.0) for i in range(5)]   # hari-2
+    trades += [buat_trade(base + 2 * HARI + i * 1000, pnl=-2.0) for i in range(5)]  # hari-3
 
-    print("\n== 3. Trade PEMBUKA (realizedPnl=0) TIDAK dihitung menang maupun kalah ==")
-    # Pola persis yang Nero tanyakan sebelumnya: baris "0.000" itu order
-    # pembuka, bukan transaksi seri.
-    trades3 = [trade(0.0, 0.3), trade(5.0, 0.3), trade(0.0, 0.3), trade(-2.0, 0.3)]
-    a3 = aggregate_trades(trades3)
-    check("n_fills = 4 (semua fill dihitung)", a3["n_fills"] == 4)
-    check("n_closing_trades = 2 (cuma yang merealisasikan sesuatu)", a3["n_closing_trades"] == 2,
-          f"dapat {a3['n_closing_trades']}")
-    check("menang=1, kalah=1", a3["n_wins"] == 1 and a3["n_losses"] == 1)
-    check("fee TETAP dihitung dari SEMUA 4 fill (0.3x4=1.2)",
-          abs(a3["total_fee"] - 1.2) < 1e-9, f"dapat {a3['total_fee']}")
+    bursa = BursaPalsu(trades)
 
-    print("\n== 4. Fallback ke info.commission kalau fee unified ccxt kosong ==")
-    trades4 = [trade(3.0, 0.7, use_unified_fee=False)]  # cuma ada di info.commission
-    a4 = aggregate_trades(trades4)
-    check("fee terbaca dari info.commission (0.7)", abs(a4["total_fee"] - 0.7) < 1e-9,
-          f"dapat {a4['total_fee']}")
-    check("n_fee_unknown = 0 (fee ketemu, cuma di tempat lain)", a4["n_fee_unknown"] == 0)
+    # Simulasikan versi LAMA (satu panggilan, limit 200) untuk perbandingan.
+    lama = bursa.fetch_my_trades("BTC/USDT:USDT", limit=200)
+    hari_di_lama = {(t["timestamp"] - base) // HARI for t in lama}
+    check("versi LAMA memang cuma dapat hari-1 (bug terkonfirmasi)",
+          hari_di_lama == {0}, f"hari yang terambil: {sorted(hari_di_lama)}")
 
-    print("\n== 5. Fee BENAR-BENAR tidak ada -> dihitung 0 TAPI DITANDAI, bukan diam-diam ==")
-    trades5 = [{"side": "buy", "price": 100, "amount": 0.01, "info": {"realizedPnl": "5.0"}}]
-    a5 = aggregate_trades(trades5)
-    check("net = 5.0 (fee dianggap 0)", abs(a5["net"] - 5.0) < 1e-9)
-    check("n_fee_unknown = 1 -- DITANDAI supaya dashboard bisa peringatkan user",
-          a5["n_fee_unknown"] == 1, f"dapat {a5['n_fee_unknown']}")
+    # Versi BARU -- paginasi.
+    baru = fetch_all_trades(bursa, "BTC/USDT:USDT", base - 1000, base + 3 * HARI, page_limit=200)
+    hari_di_baru = {(t["timestamp"] - base) // HARI for t in baru}
+    check("versi BARU dapat SEMUA 310 fill", len(baru) == 310, f"dapat {len(baru)}")
+    check("versi BARU mencakup hari-1, hari-2, DAN hari-3",
+          hari_di_baru == {0, 1, 2}, f"hari yang terambil: {sorted(hari_di_baru)}")
 
-    print("\n== 6. Statistik turunan dihitung tangan ==")
-    # menang: +10, +6 (rata +8, terbaik +10) | kalah: -4 (rata -4, terburuk -4)
-    # profit factor = 16 / 4 = 4.0 | win rate = 2/3 = 66.7%
-    a6 = aggregate_trades([trade(10.0, 0.0), trade(-4.0, 0.0), trade(6.0, 0.0)])
-    check("avg_win = 8.0", abs(a6["avg_win"] - 8.0) < 1e-9, f"dapat {a6['avg_win']}")
-    check("avg_loss = -4.0", abs(a6["avg_loss"] - (-4.0)) < 1e-9, f"dapat {a6['avg_loss']}")
-    check("best_win = 10.0", abs(a6["best_win"] - 10.0) < 1e-9)
-    check("worst_loss = -4.0", abs(a6["worst_loss"] - (-4.0)) < 1e-9)
-    check("profit_factor = 4.0", abs(a6["profit_factor"] - 4.0) < 1e-9, f"dapat {a6['profit_factor']}")
-    check("win_rate = 2/3", abs(a6["win_rate"] - 2/3) < 1e-9, f"dapat {a6['win_rate']}")
+    print("\n== 2. Tidak ada duplikat walau bursa kirim ulang di tepi halaman ==")
+    ids = [t["id"] for t in baru]
+    check("semua id unik (tidak ada trade dihitung dobel)",
+          len(ids) == len(set(ids)), f"{len(ids)} trade, {len(set(ids))} unik")
 
-    print("\n== 7. Tidak ada kalah sama sekali -> profit_factor None, bukan pembagian nol ==")
-    a7 = aggregate_trades([trade(5.0, 0.1), trade(3.0, 0.1)])
-    check("profit_factor = None (tidak crash)", a7["profit_factor"] is None)
+    print("\n== 3. Rentang > 7 hari dipotong jadi beberapa permintaan (batas Binance) ==")
+    trades_panjang = [buat_trade(base + i * HARI) for i in range(20)]  # 20 hari
+    bursa2 = BursaPalsu(trades_panjang)
+    hasil = fetch_all_trades(bursa2, "BTC/USDT:USDT", base - 1000, base + 20 * HARI, page_limit=1000)
+    check("semua 20 trade lintas 20 hari terambil", len(hasil) == 20, f"dapat {len(hasil)}")
+    check("dipecah jadi >= 3 chunk (20 hari / 7 hari per chunk)",
+          bursa2.calls >= 3, f"jumlah panggilan: {bursa2.calls}")
 
-    print("\n== 8. Daftar kosong -> semua nol, tidak crash ==")
-    a8 = aggregate_trades([])
-    check("n_fills=0, net=0, win_rate=0",
-          a8["n_fills"] == 0 and a8["net"] == 0.0 and a8["win_rate"] == 0.0)
+    print("\n== 4. Filter tanggal: cuma hari-2 ==")
+    hanya_hari2 = filter_trades_by_time(baru, base + 1 * HARI, base + 2 * HARI - 1)
+    check("5 fill (semua dari hari-2)", len(hanya_hari2) == 5, f"dapat {len(hanya_hari2)}")
+    a2 = aggregate_trades(hanya_hari2)
+    check("total realisasi hari-2 = +25.0 (5 x 5.0)", abs(a2["total_realized"] - 25.0) < 1e-9,
+          f"dapat {a2['total_realized']}")
+    check("bersih = 25.0 - fee 0.05 = 24.95", abs(a2["net"] - 24.95) < 1e-9, f"dapat {a2['net']}")
 
-    print("\n== 9. Data bentuk BINANCE SUNGGUHAN (split fill, persis pola yang Nero lihat) ==")
-    # Order pembuka terpecah 2 fill (realizedPnl 0 keduanya), lalu 1 fill penutup.
-    real_shape = [
-        {"side": "sell", "price": 75631.20, "amount": 0.0007, "fee": {"cost": 0.01058836, "currency": "USDT"},
-         "info": {"realizedPnl": "0", "commission": "0.01058836", "maker": True}},
-        {"side": "sell", "price": 75631.20, "amount": 0.0013, "fee": {"cost": 0.01966411, "currency": "USDT"},
-         "info": {"realizedPnl": "0", "commission": "0.01966411", "maker": True}},
-        {"side": "buy", "price": 75570.60, "amount": 0.0100, "fee": {"cost": 0.30228240, "currency": "USDT"},
-         "info": {"realizedPnl": "0.74599999", "commission": "0.30228240", "maker": False}},
-    ]
-    a9 = aggregate_trades(real_shape)
-    expected_fee = 0.01058836 + 0.01966411 + 0.30228240
-    expected_net = 0.74599999 - expected_fee
-    check("3 fill terbaca, tapi cuma 1 transaksi penutup",
-          a9["n_fills"] == 3 and a9["n_closing_trades"] == 1)
-    check(f"total_fee = {expected_fee:.8f}", abs(a9["total_fee"] - expected_fee) < 1e-9,
-          f"dapat {a9['total_fee']:.8f}")
-    check(f"net = {expected_net:.8f} (realisasi 0.746 - fee {expected_fee:.4f})",
-          abs(a9["net"] - expected_net) < 1e-9, f"dapat {a9['net']:.8f}")
-    print(f"     -> Realisasi +0.746 terlihat UNTUNG, tapi setelah fee: {a9['net']:+.4f} "
-          f"({'RUGI' if a9['net'] < 0 else 'untung'}) -- persis poin Nero.")
+    print("\n== 5. Filter tanggal: cuma hari-3 (rugi) -- terpisah dari hari-2 yang untung ==")
+    hanya_hari3 = filter_trades_by_time(baru, base + 2 * HARI, base + 3 * HARI)
+    a3 = aggregate_trades(hanya_hari3)
+    check("realisasi hari-3 = -10.0 (5 x -2.0)", abs(a3["total_realized"] - (-10.0)) < 1e-9,
+          f"dapat {a3['total_realized']}")
+    check("hari-2 dan hari-3 BENAR-BENAR terpisah (tidak terakumulasi)",
+          a2["total_realized"] > 0 and a3["total_realized"] < 0)
+
+    print("\n== 6. Tanpa filter -> semua terakumulasi (+25 -10 = +15) ==")
+    a_all = aggregate_trades(filter_trades_by_time(baru, None, None))
+    check("realisasi total = +15.0", abs(a_all["total_realized"] - 15.0) < 1e-9,
+          f"dapat {a_all['total_realized']}")
+
+    print("\n== 7. compute_channel: rumus sama dengan sinyal bot (max/min close SEBELUM bar terakhir) ==")
+    closes = [10, 20, 30, 25, 15, 12]  # lookback=5 -> window = 5 bar pertama, bar terakhir (12) TIDAK ikut
+    c = compute_channel(closes, lookback=5)
+    check("atas = 30 (max dari 5 bar sebelum terakhir)", c["upper"] == 30, f"dapat {c['upper']}")
+    check("bawah = 10 (min dari 5 bar sebelum terakhir)", c["lower"] == 10, f"dapat {c['lower']}")
+    check("harga acuan = 12 (bar terakhir)", c["current"] == 12)
+    check("jarak ke atas = (30-12)/12 = 150%", abs(c["dist_upper"] - 1.5) < 1e-9, f"dapat {c['dist_upper']}")
+    check("jarak ke bawah = (12-10)/12 = 16.67%", abs(c["dist_lower"] - (2/12)) < 1e-9)
+
+    print("\n== 8. compute_channel: data kurang -> None, bukan angka ngasal ==")
+    check("None untuk data kurang dari lookback+1", compute_channel([1, 2, 3], lookback=10) is None)
+
+    print("\n== 9. build_bot_command: persis perintah yang biasa Nero ketik ==")
+    cmd = build_bot_command({
+        "symbol": "BTC/USDT:USDT", "timeframe": "1m", "lookback": 200, "amount": 0.01,
+        "session_hours": 24, "take_profit_pct": 0.003, "stop_after_take_profit": True,
+        "backfill_bars": 200, "live_take_profit_poll_seconds": 5,
+    })
+    s = " ".join(cmd)
+    for bagian in ["--live", "--symbol BTC/USDT:USDT", "--timeframe 1m", "--lookback 200",
+                    "--amount 0.01", "--session-hours 24.0", "--take-profit-pct 0.003",
+                    "--stop-after-take-profit", "--backfill-bars 200",
+                    "--live-take-profit-poll-seconds 5.0"]:
+        check(f"mengandung '{bagian}'", bagian in s)
+    check("memanggil modul bot yang SUDAH ADA (bukan logika disalin)",
+          "scripts.run_paper_donchian_futures" in s)
+
+    print("\n== 10. build_bot_command: opsi kosong TIDAK dikirim (bukan dikirim nilai palsu) ==")
+    cmd2 = build_bot_command({
+        "symbol": "ETH/USDT:USDT", "timeframe": "5m", "lookback": 50, "amount": 0.1,
+        "session_hours": None, "take_profit_pct": None, "stop_after_take_profit": False,
+        "backfill_bars": None, "live_take_profit_poll_seconds": None,
+    })
+    s2 = " ".join(cmd2)
+    check("tidak ada --session-hours", "--session-hours" not in s2)
+    check("tidak ada --take-profit-pct", "--take-profit-pct" not in s2)
+    check("tidak ada --stop-after-take-profit", "--stop-after-take-profit" not in s2)
+    check("tidak ada --backfill-bars", "--backfill-bars" not in s2)
 
     print("\n" + "=" * 62)
     if FAILURES:
