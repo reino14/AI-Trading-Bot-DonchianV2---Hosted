@@ -192,6 +192,41 @@ def aggregate_trades(raw_trades: list[dict]) -> dict:
     }
 
 
+def build_equity_curve(raw_trades: list[dict]) -> list[dict]:
+    """
+    Kurva P&L KUMULATIF BERSIH dari daftar fill. FUNGSI MURNI.
+
+    Memakai definisi "bersih" YANG SAMA dengan aggregate_trades():
+    realizedPnl DIKURANGI commission. Kalau dua fungsi ini memakai
+    definisi berbeda, angka terakhir di kurva tidak akan cocok dengan
+    kartu "BERSIH" di atasnya -- dan itu bug yang sulit dilacak.
+
+    Titik pertama sengaja 0 di waktu fill pertama, supaya kurvanya
+    mulai dari garis nol, bukan langsung melompat ke nilai fill pertama.
+
+    Fill pembuka posisi realizedPnl-nya 0, jadi kurva mendatar di situ
+    lalu turun sebesar fee -- itu BENAR, bukan glitch: biaya sudah
+    keluar sebelum ada yang direalisasikan.
+    """
+    titik: list[dict] = []
+    kumulatif = 0.0
+    urut = sorted(raw_trades, key=lambda t: t.get("timestamp") or 0)
+    if urut:
+        titik.append({"t": int(urut[0].get("timestamp") or 0), "v": 0.0})
+    for t in urut:
+        info = t.get("info") or {}
+        raw_pnl = info.get("realizedPnl")
+        pnl = float(raw_pnl) if raw_pnl not in (None, "") else 0.0
+        fee_obj = t.get("fee") or {}
+        fee_cost = fee_obj.get("cost")
+        if fee_cost in (None, ""):
+            fee_cost = info.get("commission")
+        fee = float(fee_cost) if fee_cost not in (None, "") else 0.0
+        kumulatif += pnl - fee
+        titik.append({"t": int(t.get("timestamp") or 0), "v": kumulatif})
+    return titik
+
+
 def compute_channel(closes: list[float], lookback: int) -> dict | None:
     """
     Channel Donchian close-only -- RUMUS SAMA PERSIS dengan
@@ -286,12 +321,31 @@ class BotProcess:
             threading.Thread(target=self._pump_output, daemon=True).start()
             return True, "Bot dijalankan."
 
+    # Penanda di stdout bot yang berarti take-profit KENA dan penutupan
+    # sudah TERKONFIRMASI flat. Dicocokkan DUA potong sekaligus supaya
+    # baris lain yang menyebut take-profit tidak ikut memicu -- termasuk
+    # baris "Order penutup TERKIRIM tapi BELUM terkonfirmasi flat", yang
+    # justru berarti posisi MASIH TERBUKA dan bot TIDAK boleh dimatikan.
+    #
+    # KALAU TEKS LOG DI paper.py DIUBAH, mekanisme ini diam-diam berhenti
+    # bekerja tanpa error. Itu konsekuensi pendekatan "dashboard saja".
+    TP_HALT_MARKERS = ("stop_after_take_profit", "BERHENTI trading total")
+
     def _pump_output(self) -> None:
         proc = self.proc
         if proc is None or proc.stdout is None:
             return
+        sudah_minta_stop = False
         for line in proc.stdout:
             self.log.append(line.rstrip("\n"))
+            # Sekali saja -- kalau tidak, tiap baris berikutnya memanggil
+            # stop() lagi dan membanjiri log dengan "Tidak ada bot yang jalan."
+            if not sudah_minta_stop and all(m in line for m in self.TP_HALT_MARKERS):
+                sudah_minta_stop = True
+                self.log.append("--- take profit terkonfirmasi -- dashboard mengirim sinyal "
+                                "berhenti (ala Ctrl+C), sama seperti tombol Hentikan ---")
+                ok, msg = self.stop()
+                self.log.append(f"--- {msg} ---")
         self.log.append("--- proses bot berhenti ---")
 
     def stop(self) -> tuple[bool, str]:
@@ -366,9 +420,30 @@ class DashboardState:
             usdt = balance.get("USDT", {})
             wallet = float(usdt.get("total") or 0.0)
             free = float(usdt.get("free") or 0.0)
+            # "used" DILAPORKAN BURSA -- ini margin sungguhan yang terkunci,
+            # bukan hasil hitungan kita. Dipakai sebagai angka utama.
+            used_raw = usdt.get("used")
+            used = float(used_raw) if used_raw not in (None, "") else None
 
             position = broker.fetch_position(symbol)
             price = broker.fetch_current_price(symbol)
+
+            # Margin TURUNAN dari posisi -- notional / leverage. Ini ESTIMASI,
+            # disandingkan dengan "used" di atas supaya ketahuan kalau beda
+            # jauh (mis. leverage salah baca, atau ada posisi simbol lain
+            # yang ikut memakai margin di akun yang sama).
+            notional = margin_est = margin_pct = None
+            if position and price:
+                lev = float(position.get("leverage") or 0) or None
+                notional = abs(float(position.get("contracts") or 0)) * price
+                if lev:
+                    margin_est = notional / lev
+            # Persentase memakai "used" dari bursa kalau ada; kalau tidak,
+            # baru pakai estimasi. Pembaginya wallet (total ekuitas), jadi
+            # angka ini = berapa persen modal yang sedang terkunci sebagai margin.
+            margin_dipakai = used if used is not None else margin_est
+            if margin_dipakai is not None and wallet > 0:
+                margin_pct = margin_dipakai / wallet
 
             bars = broker.fetch_recent_bars(symbol, timeframe, limit=lookback + 1)
             channel = compute_channel([b["close"] for b in bars], lookback)
@@ -383,6 +458,8 @@ class DashboardState:
                     "status": "ok", "last_error": None,
                     "last_update": datetime.now(timezone.utc).isoformat(),
                     "symbol": symbol, "wallet": wallet, "free": free, "price": price,
+                    "used": used, "notional": notional, "margin_est": margin_est,
+                    "margin_dipakai": margin_dipakai, "margin_pct": margin_pct,
                     "position": position, "channel": channel,
                     "history_days": self.history_days,
                     "n_trades_loaded": len(trades),
@@ -425,6 +502,7 @@ class DashboardState:
                 "role": "maker" if info.get("maker") in (True, "true") else "taker",
             })
         snap["recent"] = recent
+        snap["equity_curve"] = build_equity_curve(filtered)
         snap["session_state"] = read_session_state()
         return snap
 
@@ -489,6 +567,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .chip { display:inline-block; padding:2px 9px; border-radius:20px; font-size:11px; font-weight:600; }
   .chip.on { background:rgba(21,128,61,.15); color:var(--hijau); }
   .chip.off { background:rgba(185,28,28,.15); color:var(--merah); }
+  .kurva { width:100%; height:230px; display:block; }
+  .kurva .garis { fill:none; stroke:var(--biru); stroke-width:2; }
+  .kurva .nol { stroke:var(--muted); stroke-width:1; stroke-dasharray:3 3; opacity:.55; }
+  .kurva .sumbu { stroke:var(--line); stroke-width:1; }
+  .kurva text { fill:var(--muted); font-size:10px; font-variant-numeric:tabular-nums; }
 </style>
 </head>
 <body>
@@ -504,11 +587,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="f"><label>Timeframe</label>
         <select id="c_timeframe"><option>1m</option><option>5m</option><option>15m</option><option>1h</option><option>4h</option></select></div>
       <div class="f"><label>Lookback (bar)</label><input id="c_lookback" type="number" value="200"></div>
-      <div class="f"><label>Amount (BTC)</label><input id="c_amount" type="number" step="0.001" value="0.01"></div>
+      <div class="f"><label>Amount (BTC)</label><input id="c_amount" type="number" step="0.001" value="0.01" oninput="hitungNotional()">
+        <div class="sub" id="ket_amount" style="font-size:11px;margin-top:5px;line-height:1.5">&mdash;</div></div>
       <div class="f"><label>Session (jam)</label><input id="c_session" type="number" step="0.5" value="24"></div>
-      <div class="f"><label>Take profit (fraksi)</label><input id="c_tp" type="number" step="0.001" value="0.003"></div>
+      <div class="f"><label>Take profit (fraksi)</label><input id="c_tp" type="number" step="0.001" value="0.005"></div>
       <div class="f"><label>Backfill (bar)</label><input id="c_backfill" type="number" value="200"></div>
-      <div class="f"><label>Poll TP (detik)</label><input id="c_poll" type="number" step="1" value="5"></div>
+      <div class="f"><label>Poll TP (detik)</label><input id="c_poll" type="number" step="1" value="1"></div>
     </div>
     <div class="baris">
       <label class="cek"><input type="checkbox" id="c_stopafter" checked> Berhenti total setelah take profit</label>
@@ -573,9 +657,93 @@ function set7Hari() {
   pilih("f_dari").value=fmt(l); pilih("f_sampai").value=fmt(h); muat();
 }
 
+// Harga terakhir dari server -- dipakai hitungNotional(). Disimpan di
+// variabel supaya keterangan di bawah field Amount ikut ter-update tiap
+// refresh, bukan cuma saat diketik.
+let hargaTerakhir = null;
+let leverageTerakhir = null;
+
+// Notional = amount x HARGA TERAKHIR dari bursa (ticker "last"), BUKAN
+// angka karangan. Kalau harga belum termuat, JANGAN tampilkan tebakan --
+// lebih baik bilang belum tahu.
+//
+// Dua angka ditampilkan karena keduanya beda dan sering tertukar:
+//   notional = nilai kontrak yang masuk ke pasar
+//   margin   = uang Anda yang benar-benar terkunci = notional / leverage
+function hitungNotional() {
+  const el = pilih("ket_amount");
+  if (!el) return;
+  const amt = parseFloat(pilih("c_amount").value);
+  if (!amt || !hargaTerakhir) {
+    el.innerHTML = hargaTerakhir
+      ? "&mdash;"
+      : "menunggu harga dari bursa&hellip;";
+    return;
+  }
+  const notional = amt * hargaTerakhir;
+  let teks = `&asymp; <b>${notional.toFixed(2)} USDT</b> nilai kontrak `
+           + `<span style="opacity:.75">(${amt} &times; ${hargaTerakhir.toFixed(2)})</span>`;
+  if (leverageTerakhir) {
+    teks += `<br>margin terkunci &asymp; <b>${(notional/leverageTerakhir).toFixed(2)} USDT</b> `
+          + `pada ${leverageTerakhir.toFixed(0)}x`;
+  } else {
+    teks += `<br><span style="opacity:.75">leverage belum diketahui (belum ada posisi terbuka) &mdash; `
+          + `margin = notional dibagi leverage</span>`;
+  }
+  el.innerHTML = teks;
+}
+
+// Kurva SVG digambar manual -- tanpa library, supaya dashboard tetap
+// satu file dan tidak perlu koneksi ke CDN.
+function gambarKurva(titik) {
+  if (!titik || titik.length < 2) {
+    return `<div class="sub">Belum cukup transaksi di rentang ini untuk menggambar kurva.</div>`;
+  }
+  const W = 1000, H = 230, padL = 58, padR = 14, padT = 14, padB = 26;
+  const xs = titik.map(p => p.t), ys = titik.map(p => p.v);
+  const tMin = Math.min(...xs), tMax = Math.max(...xs);
+  let vMin = Math.min(...ys, 0), vMax = Math.max(...ys, 0);
+  if (vMax === vMin) { vMax = vMin + 1; }
+  const pad = (vMax - vMin) * 0.08;
+  vMin -= pad; vMax += pad;
+  const px = t => padL + (tMax === tMin ? 0 : (t - tMin) / (tMax - tMin)) * (W - padL - padR);
+  const py = v => padT + (1 - (v - vMin) / (vMax - vMin)) * (H - padT - padB);
+
+  const d = titik.map((p, i) => (i ? "L" : "M") + px(p.t).toFixed(1) + " " + py(p.v).toFixed(1)).join(" ");
+  const akhir = ys[ys.length - 1];
+  const warna = akhir >= 0 ? "var(--hijau)" : "var(--merah)";
+
+  let sumbu = "";
+  for (let i = 0; i <= 4; i++) {
+    const v = vMin + (vMax - vMin) * i / 4, y = py(v);
+    sumbu += `<line class="sumbu" x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}"/>`
+           + `<text x="${padL - 6}" y="${(y + 3).toFixed(1)}" text-anchor="end">${v.toFixed(2)}</text>`;
+  }
+  const y0 = py(0);
+  sumbu += `<line class="nol" x1="${padL}" y1="${y0.toFixed(1)}" x2="${W - padR}" y2="${y0.toFixed(1)}"/>`;
+  const fmt = ms => new Date(ms).toLocaleDateString("id-ID", {day:"2-digit", month:"short"});
+  sumbu += `<text x="${padL}" y="${H - 8}">${fmt(tMin)}</text>`
+         + `<text x="${W - padR}" y="${H - 8}" text-anchor="end">${fmt(tMax)}</text>`;
+
+  return `<svg class="kurva" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
+      aria-label="Kurva P&amp;L kumulatif bersih">${sumbu}
+      <path class="garis" style="stroke:${warna}" d="${d}"/>
+      <circle cx="${px(xs[xs.length-1]).toFixed(1)}" cy="${py(akhir).toFixed(1)}" r="3.5" fill="${warna}"/>
+    </svg>
+    <div class="sub" style="margin-top:8px">Akhir kurva
+      <b style="color:${warna}">${akhir.toFixed(4)} USDT</b> &middot; ${titik.length - 1} fill &middot;
+      realizedPnl dikurangi fee, definisi sama dengan kartu BERSIH di bawah.</div>`;
+}
+
 function render(d) {
   pilih("jam").textContent = "diperbarui " + (d.last_update ? new Date(d.last_update).toLocaleTimeString("id-ID") : "?")
     + (d.n_trades_loaded !== undefined ? ` · ${d.n_trades_loaded} fill dimuat (${d.history_days} hari terakhir)` : "");
+
+  // Simpan harga & leverage supaya keterangan di bawah field Amount ikut
+  // hidup mengikuti pasar, bukan hanya saat pengguna mengetik.
+  if (typeof d.price === "number") hargaTerakhir = d.price;
+  leverageTerakhir = (d.position && d.position.leverage) ? d.position.leverage : null;
+  hitungNotional();
 
   const b = d.bot || {};
   pilih("btn_start").disabled = !!b.running;
@@ -606,7 +774,30 @@ function render(d) {
     <div class="item"><div class="label">Leverage</div><div class="val">${
       d.position&&d.position.leverage?d.position.leverage.toFixed(0)+"x":"&mdash;"}</div></div>
     <div class="item"><div class="label">Saldo dompet</div><div class="val">${d.wallet!==undefined?d.wallet.toFixed(2):"?"}</div></div>
+    <div class="item"><div class="label">Margin terpakai</div><div class="val ${
+      d.margin_pct===null||d.margin_pct===undefined ? "" : (d.margin_pct>0.5?"merah-t":(d.margin_pct>0.25?"kuning-t":""))}">${
+      d.margin_pct===null||d.margin_pct===undefined ? "&mdash;" : (d.margin_pct*100).toFixed(1)+"%"}</div>
+      <div class="note">${d.margin_dipakai!==null&&d.margin_dipakai!==undefined
+        ? d.margin_dipakai.toFixed(2)+" dari "+(d.wallet||0).toFixed(2)+" USDT"
+        : "tidak ada posisi / data margin"}</div></div>
+    <div class="item"><div class="label">Nilai kontrak (notional)</div><div class="val">${
+      d.notional?d.notional.toFixed(2):"&mdash;"}</div>
+      <div class="note">${d.notional&&d.margin_est
+        ? "margin estimasi "+d.margin_est.toFixed(2)+" USDT"
+        : "&mdash;"}</div></div>
   </div></div>`;
+  // Kalau angka bursa dan angka turunan beda jauh, itu sinyal ada yang
+  // tidak beres (leverage salah baca, atau posisi simbol lain ikut
+  // memakai margin) -- lebih baik diberitahu daripada diam.
+  if (d.used !== null && d.used !== undefined && d.margin_est) {
+    const selisih = Math.abs(d.used - d.margin_est);
+    if (selisih > Math.max(1, d.margin_est * 0.15)) {
+      h += `<div class="warn"><b>Margin tidak cocok:</b> bursa melaporkan
+        ${d.used.toFixed(2)} USDT terpakai, tapi dari posisi ${d.symbol} hasilnya
+        ${d.margin_est.toFixed(2)} USDT. Kemungkinan ada posisi simbol lain, atau
+        leverage salah terbaca.</div>`;
+    }
+  }
 
   h += `<h2>Batas breakout &mdash; channel Donchian</h2><div class="panel">`;
   if (!c) {
@@ -631,6 +822,9 @@ function render(d) {
 
   // ---- Filter tanggal ----
   const fl = d.filter || {};
+  h += `<h2>Perkembangan portofolio &mdash; P&amp;L kumulatif bersih</h2><div class="panel">
+    ${gambarKurva(d.equity_curve)}</div>`;
+
   h += `<h2>Untung dan rugi &mdash; per rentang tanggal</h2>
     <div class="panel" style="margin-bottom:14px"><div class="baris" style="margin-top:0">
       <div class="f"><label>Dari</label><input type="date" id="f_dari" onchange="muat()"></div>
