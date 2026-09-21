@@ -192,6 +192,36 @@ def aggregate_trades(raw_trades: list[dict]) -> dict:
     }
 
 
+def hitung_pertumbuhan(wallet: float | None, net: float) -> dict | None:
+    """
+    Pertumbuhan portofolio: laba BERSIH dibagi MODAL AWAL. FUNGSI MURNI.
+
+    Pembaginya SENGAJA bukan wallet sekarang. Wallet sekarang sudah
+    mengandung labanya, jadi membaginya dengan itu membuat persentase
+    terlihat lebih kecil dari kenyataan (dan untuk rugi, lebih kecil dari
+    kerugian sebenarnya). Modal awal = wallet sekarang - laba bersih.
+
+    BATASNYA, dan ini penting: angka ini hanya benar kalau
+    (a) TIDAK ada setor/tarik dana selama rentang yang dipilih, dan
+    (b) rentangnya mencakup semua trading yang membentuk saldo itu.
+    Kalau Anda menyaring "hari ini" saja padahal bot sudah jalan seminggu,
+    modal awal yang dihitung di sini adalah saldo awal HARI INI, bukan
+    saldo awal Anda seminggu lalu. Ditandai lewat 'asumsi' di bawah.
+    """
+    if wallet is None or wallet <= 0:
+        return None
+    modal_awal = wallet - net
+    if modal_awal <= 0:
+        return {"wallet": wallet, "net": net, "modal_awal": None, "pct": None,
+                "asumsi": "modal awal tidak masuk akal (<=0) -- kemungkinan ada setor/tarik dana"}
+    return {
+        "wallet": wallet, "net": net, "modal_awal": modal_awal,
+        "pct": net / modal_awal,
+        "asumsi": "dihitung dari saldo sekarang dikurangi laba rentang ini; "
+                  "tidak memperhitungkan setor/tarik dana",
+    }
+
+
 def build_equity_curve(raw_trades: list[dict]) -> list[dict]:
     """
     Kurva P&L KUMULATIF BERSIH dari daftar fill. FUNGSI MURNI.
@@ -503,6 +533,7 @@ class DashboardState:
             })
         snap["recent"] = recent
         snap["equity_curve"] = build_equity_curve(filtered)
+        snap["porto"] = hitung_pertumbuhan(snap.get("wallet"), snap["agg"]["net"])
         snap["session_state"] = read_session_state()
         return snap
 
@@ -567,7 +598,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .chip { display:inline-block; padding:2px 9px; border-radius:20px; font-size:11px; font-weight:600; }
   .chip.on { background:rgba(21,128,61,.15); color:var(--hijau); }
   .chip.off { background:rgba(185,28,28,.15); color:var(--merah); }
-  .kurva { width:100%; height:230px; display:block; }
+  .kurva { width:100%; max-width:980px; height:auto; display:block; margin:0 auto; }
   .kurva .garis { fill:none; stroke:var(--biru); stroke-width:2; }
   .kurva .nol { stroke:var(--muted); stroke-width:1; stroke-dasharray:3 3; opacity:.55; }
   .kurva .sumbu { stroke:var(--line); stroke-width:1; }
@@ -587,7 +618,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="f"><label>Timeframe</label>
         <select id="c_timeframe"><option>1m</option><option>5m</option><option>15m</option><option>1h</option><option>4h</option></select></div>
       <div class="f"><label>Lookback (bar)</label><input id="c_lookback" type="number" value="200"></div>
-      <div class="f"><label>Amount (BTC)</label><input id="c_amount" type="number" step="0.001" value="0.01" oninput="hitungNotional()">
+      <div class="f"><label>Amount (BTC)</label><input id="c_amount" type="number" step="0.001" value="0.001" oninput="hitungNotional()">
         <div class="sub" id="ket_amount" style="font-size:11px;margin-top:5px;line-height:1.5">&mdash;</div></div>
       <div class="f"><label>Session (jam)</label><input id="c_session" type="number" step="0.5" value="24"></div>
       <div class="f"><label>Take profit (fraksi)</label><input id="c_tp" type="number" step="0.001" value="0.005"></div>
@@ -674,65 +705,87 @@ function hitungNotional() {
   const el = pilih("ket_amount");
   if (!el) return;
   const amt = parseFloat(pilih("c_amount").value);
-  if (!amt || !hargaTerakhir) {
-    el.innerHTML = hargaTerakhir
-      ? "&mdash;"
-      : "menunggu harga dari bursa&hellip;";
-    return;
-  }
+  if (!amt || !hargaTerakhir) { el.innerHTML = "&mdash;"; return; }
   const notional = amt * hargaTerakhir;
-  let teks = `&asymp; <b>${notional.toFixed(2)} USDT</b> nilai kontrak `
-           + `<span style="opacity:.75">(${amt} &times; ${hargaTerakhir.toFixed(2)})</span>`;
-  if (leverageTerakhir) {
-    teks += `<br>margin terkunci &asymp; <b>${(notional/leverageTerakhir).toFixed(2)} USDT</b> `
-          + `pada ${leverageTerakhir.toFixed(0)}x`;
-  } else {
-    teks += `<br><span style="opacity:.75">leverage belum diketahui (belum ada posisi terbuka) &mdash; `
-          + `margin = notional dibagi leverage</span>`;
-  }
-  el.innerHTML = teks;
+  el.innerHTML = leverageTerakhir
+    ? `<b>${notional.toFixed(2)} USDT</b> &middot; margin ${(notional/leverageTerakhir).toFixed(2)}`
+    : `<b>${notional.toFixed(2)} USDT</b>`;
 }
 
-// Kurva SVG digambar manual -- tanpa library, supaya dashboard tetap
-// satu file dan tidak perlu koneksi ke CDN.
-function gambarKurva(titik) {
+// Kurva ekuitas. Digambar manual tanpa library supaya dashboard tetap
+// satu file. preserveAspectRatio TIDAK dimatikan -- versi sebelumnya
+// memakai "none" dan itu meregangkan gambar mengikuti lebar layar,
+// yang membuat bentuknya terlihat aneh dan kemiringannya menipu.
+function gambarKurva(titik, porto) {
   if (!titik || titik.length < 2) {
-    return `<div class="sub">Belum cukup transaksi di rentang ini untuk menggambar kurva.</div>`;
+    return `<div class="sub">Belum ada transaksi di rentang ini.</div>`;
   }
-  const W = 1000, H = 230, padL = 58, padR = 14, padT = 14, padB = 26;
+  const W = 980, H = 300, padL = 74, padR = 22, padT = 22, padB = 46;
   const xs = titik.map(p => p.t), ys = titik.map(p => p.v);
   const tMin = Math.min(...xs), tMax = Math.max(...xs);
-  let vMin = Math.min(...ys, 0), vMax = Math.max(...ys, 0);
-  if (vMax === vMin) { vMax = vMin + 1; }
-  const pad = (vMax - vMin) * 0.08;
-  vMin -= pad; vMax += pad;
+  let lo = Math.min(...ys, 0), hi = Math.max(...ys, 0);
+  if (hi === lo) hi = lo + 1;
+  const ruang = (hi - lo) * 0.12; lo -= ruang; hi += ruang;
   const px = t => padL + (tMax === tMin ? 0 : (t - tMin) / (tMax - tMin)) * (W - padL - padR);
-  const py = v => padT + (1 - (v - vMin) / (vMax - vMin)) * (H - padT - padB);
+  const py = v => padT + (1 - (v - lo) / (hi - lo)) * (H - padT - padB);
 
-  const d = titik.map((p, i) => (i ? "L" : "M") + px(p.t).toFixed(1) + " " + py(p.v).toFixed(1)).join(" ");
   const akhir = ys[ys.length - 1];
+  const puncak = Math.max(...ys), lembah = Math.min(...ys);
   const warna = akhir >= 0 ? "var(--hijau)" : "var(--merah)";
-
-  let sumbu = "";
-  for (let i = 0; i <= 4; i++) {
-    const v = vMin + (vMax - vMin) * i / 4, y = py(v);
-    sumbu += `<line class="sumbu" x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}"/>`
-           + `<text x="${padL - 6}" y="${(y + 3).toFixed(1)}" text-anchor="end">${v.toFixed(2)}</text>`;
-  }
   const y0 = py(0);
-  sumbu += `<line class="nol" x1="${padL}" y1="${y0.toFixed(1)}" x2="${W - padR}" y2="${y0.toFixed(1)}"/>`;
-  const fmt = ms => new Date(ms).toLocaleDateString("id-ID", {day:"2-digit", month:"short"});
-  sumbu += `<text x="${padL}" y="${H - 8}">${fmt(tMin)}</text>`
-         + `<text x="${W - padR}" y="${H - 8}" text-anchor="end">${fmt(tMax)}</text>`;
 
-  return `<svg class="kurva" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
-      aria-label="Kurva P&amp;L kumulatif bersih">${sumbu}
-      <path class="garis" style="stroke:${warna}" d="${d}"/>
-      <circle cx="${px(xs[xs.length-1]).toFixed(1)}" cy="${py(akhir).toFixed(1)}" r="3.5" fill="${warna}"/>
+  // Garis bantu + label sumbu Y
+  let bantu = "";
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4, y = py(v);
+    bantu += `<line class="sumbu" x1="${padL}" y1="${y.toFixed(1)}" x2="${W-padR}" y2="${y.toFixed(1)}"/>`
+           + `<text x="${padL-8}" y="${(y+3.5).toFixed(1)}" text-anchor="end">${v.toFixed(2)}</text>`;
+  }
+  bantu += `<line class="nol" x1="${padL}" y1="${y0.toFixed(1)}" x2="${W-padR}" y2="${y0.toFixed(1)}"/>`
+         + `<text x="${W-padR}" y="${(y0-6).toFixed(1)}" text-anchor="end" style="opacity:.8">impas</text>`;
+
+  // Judul sumbu -- ini yang bikin "isinya apa" langsung terbaca
+  bantu += `<text x="14" y="${(padT+ (H-padT-padB)/2).toFixed(1)}" transform="rotate(-90 14 ${(padT+(H-padT-padB)/2).toFixed(1)})" text-anchor="middle" style="font-size:11px">P&amp;L kumulatif (USDT)</text>`;
+
+  // Label waktu: awal, tengah, akhir
+  const fmt = ms => new Date(ms).toLocaleString("id-ID", {day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit"});
+  bantu += `<text x="${padL}" y="${H-16}">${fmt(tMin)}</text>`
+         + `<text x="${W-padR}" y="${H-16}" text-anchor="end">${fmt(tMax)}</text>`;
+
+  // Area di bawah garis -- memperjelas arah, hijau di atas impas / merah di bawah
+  const garis = titik.map((p,i) => (i?"L":"M") + px(p.t).toFixed(1) + " " + py(p.v).toFixed(1)).join(" ");
+  const area = `M ${px(xs[0]).toFixed(1)} ${y0.toFixed(1)} `
+             + titik.map(p => "L " + px(p.t).toFixed(1) + " " + py(p.v).toFixed(1)).join(" ")
+             + ` L ${px(xs[xs.length-1]).toFixed(1)} ${y0.toFixed(1)} Z`;
+
+  // Titik tiap fill -- 12 fill semalam kalau tidak ditandai terlihat seperti
+  // garis patah acak; dengan titik, jelas tiap patahan = satu transaksi.
+  const noktah = titik.map((p,i) =>
+    `<circle cx="${px(p.t).toFixed(1)}" cy="${py(p.v).toFixed(1)}" r="${i===titik.length-1?4.5:2.6}"
+       fill="${i===titik.length-1?warna:"var(--bg)"}" stroke="${warna}" stroke-width="1.6"/>`).join("");
+
+  return `<svg class="kurva" viewBox="0 0 ${W} ${H}" role="img" aria-label="Kurva P&amp;L kumulatif bersih">
+      ${bantu}
+      <path d="${area}" fill="${warna}" opacity="0.12"/>
+      <path class="garis" style="stroke:${warna}" d="${garis}"/>
+      ${noktah}
     </svg>
-    <div class="sub" style="margin-top:8px">Akhir kurva
-      <b style="color:${warna}">${akhir.toFixed(4)} USDT</b> &middot; ${titik.length - 1} fill &middot;
-      realizedPnl dikurangi fee, definisi sama dengan kartu BERSIH di bawah.</div>`;
+    <div class="grid" style="margin-top:14px">
+      <div class="item"><div class="label">Posisi akhir</div>
+        <div class="val" style="color:${warna}">${akhir>=0?"+":""}${akhir.toFixed(2)} USDT</div></div>
+      <div class="item"><div class="label">Puncak tertinggi</div>
+        <div class="val">${puncak>=0?"+":""}${puncak.toFixed(2)}</div></div>
+      <div class="item"><div class="label">Titik terendah</div>
+        <div class="val">${lembah>=0?"+":""}${lembah.toFixed(2)}</div></div>
+      <div class="item"><div class="label">Turun dari puncak</div>
+        <div class="val ${(puncak-akhir)>0?"merah-t":""}">${(puncak-akhir).toFixed(2)}</div></div>
+      <div class="item"><div class="label">Jumlah fill</div><div class="val">${titik.length-1}</div></div>
+      ${porto && porto.pct!==null ? `<div class="item"><div class="label">Terhadap modal</div>
+        <div class="val ${porto.pct>=0?"hijau-t":"merah-t"}">${porto.pct>=0?"+":""}${(porto.pct*100).toFixed(3)}%</div></div>` : ""}
+    </div>
+    <div class="sub" style="margin-top:10px">Tiap titik = satu fill. Nilainya realized P&amp;L
+      dikurangi fee, definisi sama dengan kartu BERSIH di bawah.
+      ${porto && porto.asumsi ? "<br>Persentase: " + porto.asumsi + "." : ""}</div>`;
 }
 
 function render(d) {
@@ -774,30 +827,13 @@ function render(d) {
     <div class="item"><div class="label">Leverage</div><div class="val">${
       d.position&&d.position.leverage?d.position.leverage.toFixed(0)+"x":"&mdash;"}</div></div>
     <div class="item"><div class="label">Saldo dompet</div><div class="val">${d.wallet!==undefined?d.wallet.toFixed(2):"?"}</div></div>
-    <div class="item"><div class="label">Margin terpakai</div><div class="val ${
-      d.margin_pct===null||d.margin_pct===undefined ? "" : (d.margin_pct>0.5?"merah-t":(d.margin_pct>0.25?"kuning-t":""))}">${
-      d.margin_pct===null||d.margin_pct===undefined ? "&mdash;" : (d.margin_pct*100).toFixed(1)+"%"}</div>
-      <div class="note">${d.margin_dipakai!==null&&d.margin_dipakai!==undefined
-        ? d.margin_dipakai.toFixed(2)+" dari "+(d.wallet||0).toFixed(2)+" USDT"
-        : "tidak ada posisi / data margin"}</div></div>
-    <div class="item"><div class="label">Nilai kontrak (notional)</div><div class="val">${
-      d.notional?d.notional.toFixed(2):"&mdash;"}</div>
-      <div class="note">${d.notional&&d.margin_est
-        ? "margin estimasi "+d.margin_est.toFixed(2)+" USDT"
-        : "&mdash;"}</div></div>
+    <div class="item"><div class="label">Pertumbuhan portofolio</div><div class="val ${
+      !d.porto||d.porto.pct===null ? "" : (d.porto.pct>=0?"hijau-t":"merah-t")}">${
+      !d.porto||d.porto.pct===null ? "&mdash;" : (d.porto.pct>=0?"+":"")+(d.porto.pct*100).toFixed(3)+"%"}</div>
+      <div class="note">${d.porto&&d.porto.modal_awal
+        ? (d.porto.net>=0?"+":"")+d.porto.net.toFixed(2)+" USDT dari modal "+d.porto.modal_awal.toFixed(2)
+        : "belum ada data saldo"}</div></div>
   </div></div>`;
-  // Kalau angka bursa dan angka turunan beda jauh, itu sinyal ada yang
-  // tidak beres (leverage salah baca, atau posisi simbol lain ikut
-  // memakai margin) -- lebih baik diberitahu daripada diam.
-  if (d.used !== null && d.used !== undefined && d.margin_est) {
-    const selisih = Math.abs(d.used - d.margin_est);
-    if (selisih > Math.max(1, d.margin_est * 0.15)) {
-      h += `<div class="warn"><b>Margin tidak cocok:</b> bursa melaporkan
-        ${d.used.toFixed(2)} USDT terpakai, tapi dari posisi ${d.symbol} hasilnya
-        ${d.margin_est.toFixed(2)} USDT. Kemungkinan ada posisi simbol lain, atau
-        leverage salah terbaca.</div>`;
-    }
-  }
 
   h += `<h2>Batas breakout &mdash; channel Donchian</h2><div class="panel">`;
   if (!c) {
@@ -823,7 +859,7 @@ function render(d) {
   // ---- Filter tanggal ----
   const fl = d.filter || {};
   h += `<h2>Perkembangan portofolio &mdash; P&amp;L kumulatif bersih</h2><div class="panel">
-    ${gambarKurva(d.equity_curve)}</div>`;
+    ${gambarKurva(d.equity_curve, d.porto)}</div>`;
 
   h += `<h2>Untung dan rugi &mdash; per rentang tanggal</h2>
     <div class="panel" style="margin-bottom:14px"><div class="baris" style="margin-top:0">
