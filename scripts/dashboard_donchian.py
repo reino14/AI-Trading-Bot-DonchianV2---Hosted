@@ -787,11 +787,29 @@ function gambarKurva(titik, porto) {
   }
   penanda += tanda(n-1, akhir, (akhir>=0?"+":"")+akhir.toFixed(1), warna, akhir >= puncak*0.98);
 
-  return `<svg class="kurva" viewBox="0 0 ${W} ${H}" role="img" aria-label="Kurva P&amp;L kumulatif bersih">
+  // Koordinat tiap titik ditanam sebagai data atribut supaya pasangHover()
+  // tidak perlu menghitung ulang geometri -- satu sumber kebenaran.
+  const dataTitik = JSON.stringify(titik.map((p,i) => [
+    +px(i).toFixed(1), +py(p.v).toFixed(1), p.v, p.t]));
+
+  return `<svg id="svg_kurva" class="kurva" viewBox="0 0 ${W} ${H}"
+      data-titik='${dataTitik}' data-plot="${padL},${W-padR},${padT},${H-padB}"
+      data-warna="${akhir>=0?'hijau':'merah'}"
+      role="img" aria-label="Kurva P&amp;L kumulatif bersih">
       ${bantu}
       <path d="${area}" fill="${warna}" opacity="0.10"/>
       <path class="garis" style="stroke:${warna};stroke-width:1.8" d="${garis}"/>
       ${noktah}${penanda}
+      <g id="tip_g" style="display:none;pointer-events:none">
+        <line id="tip_garis" y1="${padT}" y2="${H-padB}"
+          stroke="var(--fg)" stroke-width="1" opacity=".45" stroke-dasharray="3 3"/>
+        <circle id="tip_bulat" r="4.5" fill="${warna}" stroke="var(--bg)" stroke-width="2"/>
+        <rect id="tip_kotak" rx="5" fill="var(--bg)" stroke="var(--line)" stroke-width="1"/>
+        <text id="tip_baris1" style="font-size:12px;font-weight:600;fill:var(--fg)"></text>
+        <text id="tip_baris2" style="font-size:10.5px;fill:var(--muted)"></text>
+      </g>
+      <rect id="tip_area" x="${padL}" y="${padT}" width="${W-padL-padR}" height="${H-padT-padB}"
+        fill="transparent" style="cursor:crosshair"/>
     </svg>
     <div class="grid" style="margin-top:16px">
       <div class="item"><div class="label">Posisi akhir</div>
@@ -811,6 +829,66 @@ function gambarKurva(titik, porto) {
     <div class="sub" style="margin-top:10px">Sumbu mendatar = urutan fill, bukan waktu &mdash;
       supaya jeda panjang antar sesi tidak meratakan kurvanya. Nilai = realized P&amp;L dikurangi fee.
       ${porto && porto.asumsi ? "<br>Persentase: " + porto.asumsi + "." : ""}</div>`;
+}
+
+// Hover pada kurva. Dipasang ULANG tiap render karena innerHTML
+// mengganti seluruh elemen SVG -- listener lama ikut terbuang bersamanya.
+function pasangHover() {
+  const svg = pilih("svg_kurva");
+  if (!svg) return;
+  let titik;
+  try { titik = JSON.parse(svg.dataset.titik || "[]"); } catch (e) { return; }
+  if (!titik.length) return;
+
+  const [plotKiri, plotKanan, plotAtas, plotBawah] = svg.dataset.plot.split(",").map(Number);
+  const W = svg.viewBox.baseVal.width;
+  const g = pilih("tip_g"), garis = pilih("tip_garis"), bulat = pilih("tip_bulat");
+  const kotak = pilih("tip_kotak"), b1 = pilih("tip_baris1"), b2 = pilih("tip_baris2");
+
+  function posisikan(ev) {
+    // Lebar tampil SVG berubah mengikuti layar, sementara koordinat di
+    // dalamnya memakai viewBox. Jadi posisi mouse harus diskalakan dulu,
+    // kalau tidak titik yang disorot akan meleset makin jauh ke kanan.
+    const kotakSvg = svg.getBoundingClientRect();
+    const x = (ev.clientX - kotakSvg.left) / kotakSvg.width * W;
+
+    let terdekat = 0, jarak = Infinity;
+    for (let i = 0; i < titik.length; i++) {
+      const d = Math.abs(titik[i][0] - x);
+      if (d < jarak) { jarak = d; terdekat = i; }
+    }
+    const [tx, ty, nilai, waktu] = titik[terdekat];
+
+    garis.setAttribute("x1", tx); garis.setAttribute("x2", tx);
+    bulat.setAttribute("cx", tx); bulat.setAttribute("cy", ty);
+
+    const teks1 = (nilai >= 0 ? "+" : "") + nilai.toFixed(2) + " USDT";
+    const teks2 = "fill ke-" + terdekat + " \u00b7 " +
+      new Date(waktu).toLocaleString("id-ID", {day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit"});
+    b1.textContent = teks1; b2.textContent = teks2;
+
+    const lebar = Math.max(teks1.length * 7.6, teks2.length * 5.6) + 20;
+    const tinggi = 40;
+    // Balik ke kiri kalau mepet tepi kanan, supaya kotaknya tidak terpotong.
+    let kx = tx + 14;
+    if (kx + lebar > plotKanan) kx = tx - 14 - lebar;
+    let ky = ty - tinggi - 10;
+    if (ky < plotAtas) ky = ty + 12;
+
+    kotak.setAttribute("x", kx); kotak.setAttribute("y", ky);
+    kotak.setAttribute("width", lebar); kotak.setAttribute("height", tinggi);
+    b1.setAttribute("x", kx + 10); b1.setAttribute("y", ky + 17);
+    b2.setAttribute("x", kx + 10); b2.setAttribute("y", ky + 32);
+    g.style.display = "";
+  }
+
+  const area = pilih("tip_area");
+  area.addEventListener("mousemove", posisikan);
+  area.addEventListener("mouseleave", () => { g.style.display = "none"; });
+  // Sentuhan di layar sentuh diperlakukan sama seperti gerakan mouse.
+  area.addEventListener("touchmove", ev => {
+    if (ev.touches[0]) posisikan(ev.touches[0]);
+  }, {passive: true});
 }
 
 function render(d) {
@@ -949,6 +1027,7 @@ function render(d) {
 
   const dari = pilih("f_dari")?.value, sampai = pilih("f_sampai")?.value;
   pilih("isi").innerHTML = h;
+  pasangHover();  // listener ikut terbuang saat innerHTML diganti -- pasang ulang
   if (dari) pilih("f_dari").value = dari;
   if (sampai) pilih("f_sampai").value = sampai;
 
