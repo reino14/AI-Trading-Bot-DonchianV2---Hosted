@@ -712,79 +712,104 @@ function hitungNotional() {
     : `<b>${notional.toFixed(2)} USDT</b>`;
 }
 
-// Kurva ekuitas. Digambar manual tanpa library supaya dashboard tetap
-// satu file. preserveAspectRatio TIDAK dimatikan -- versi sebelumnya
-// memakai "none" dan itu meregangkan gambar mengikuti lebar layar,
-// yang membuat bentuknya terlihat aneh dan kemiringannya menipu.
+// Kurva ekuitas, digambar manual tanpa library.
+//
+// Sumbu X memakai URUTAN FILL, bukan waktu. Alasannya: bot ini bisa
+// menghasilkan ratusan fill yang menggerombol di beberapa jam saja,
+// lalu diam berhari-hari. Dengan sumbu waktu, hasilnya gurun datar
+// panjang diselingi tebing vertikal -- yang justru menyembunyikan
+// pergerakannya. Dengan urutan fill, tiap transaksi dapat lebar yang
+// sama dan bentuk kurvanya terbaca. Konteks waktu tetap ada lewat
+// label tanggal di bawah.
 function gambarKurva(titik, porto) {
   if (!titik || titik.length < 2) {
     return `<div class="sub">Belum ada transaksi di rentang ini.</div>`;
   }
-  const W = 980, H = 300, padL = 74, padR = 22, padT = 22, padB = 46;
-  const xs = titik.map(p => p.t), ys = titik.map(p => p.v);
-  const tMin = Math.min(...xs), tMax = Math.max(...xs);
+  const n = titik.length;
+  const W = 980, H = 330, padL = 78, padR = 26, padT = 26, padB = 56;
+  const ys = titik.map(p => p.v);
   let lo = Math.min(...ys, 0), hi = Math.max(...ys, 0);
   if (hi === lo) hi = lo + 1;
-  const ruang = (hi - lo) * 0.12; lo -= ruang; hi += ruang;
-  const px = t => padL + (tMax === tMin ? 0 : (t - tMin) / (tMax - tMin)) * (W - padL - padR);
+  const ruang = (hi - lo) * 0.1; lo -= ruang; hi += ruang;
+  const px = i => padL + (n === 1 ? 0 : i / (n - 1)) * (W - padL - padR);
   const py = v => padT + (1 - (v - lo) / (hi - lo)) * (H - padT - padB);
 
-  const akhir = ys[ys.length - 1];
-  const puncak = Math.max(...ys), lembah = Math.min(...ys);
+  const akhir = ys[n - 1];
+  const iPuncak = ys.indexOf(Math.max(...ys)), iLembah = ys.indexOf(Math.min(...ys));
+  const puncak = ys[iPuncak], lembah = ys[iLembah];
   const warna = akhir >= 0 ? "var(--hijau)" : "var(--merah)";
   const y0 = py(0);
 
-  // Garis bantu + label sumbu Y
   let bantu = "";
   for (let i = 0; i <= 4; i++) {
     const v = lo + (hi - lo) * i / 4, y = py(v);
     bantu += `<line class="sumbu" x1="${padL}" y1="${y.toFixed(1)}" x2="${W-padR}" y2="${y.toFixed(1)}"/>`
-           + `<text x="${padL-8}" y="${(y+3.5).toFixed(1)}" text-anchor="end">${v.toFixed(2)}</text>`;
+           + `<text x="${padL-9}" y="${(y+3.5).toFixed(1)}" text-anchor="end">${v.toFixed(1)}</text>`;
   }
   bantu += `<line class="nol" x1="${padL}" y1="${y0.toFixed(1)}" x2="${W-padR}" y2="${y0.toFixed(1)}"/>`
-         + `<text x="${W-padR}" y="${(y0-6).toFixed(1)}" text-anchor="end" style="opacity:.8">impas</text>`;
+         + `<text x="${padL+5}" y="${(y0-6).toFixed(1)}" style="opacity:.85">impas</text>`;
+  const ty = padT + (H - padT - padB) / 2;
+  bantu += `<text x="16" y="${ty.toFixed(1)}" transform="rotate(-90 16 ${ty.toFixed(1)})" text-anchor="middle" style="font-size:11px">P&amp;L kumulatif (USDT)</text>`;
 
-  // Judul sumbu -- ini yang bikin "isinya apa" langsung terbaca
-  bantu += `<text x="14" y="${(padT+ (H-padT-padB)/2).toFixed(1)}" transform="rotate(-90 14 ${(padT+(H-padT-padB)/2).toFixed(1)})" text-anchor="middle" style="font-size:11px">P&amp;L kumulatif (USDT)</text>`;
-
-  // Label waktu: awal, tengah, akhir
+  // Label waktu di 4 titik -- konteks kapan, tanpa mengorbankan bentuk kurva
   const fmt = ms => new Date(ms).toLocaleString("id-ID", {day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit"});
-  bantu += `<text x="${padL}" y="${H-16}">${fmt(tMin)}</text>`
-         + `<text x="${W-padR}" y="${H-16}" text-anchor="end">${fmt(tMax)}</text>`;
+  for (let k = 0; k <= 3; k++) {
+    const i = Math.round((n - 1) * k / 3), x = px(i);
+    const anchor = k === 0 ? "start" : (k === 3 ? "end" : "middle");
+    bantu += `<line class="sumbu" x1="${x.toFixed(1)}" y1="${padT}" x2="${x.toFixed(1)}" y2="${H-padB}" opacity=".45"/>`
+           + `<text x="${x.toFixed(1)}" y="${H-32}" text-anchor="${anchor}">${fmt(titik[i].t)}</text>`;
+  }
+  bantu += `<text x="${((padL+W-padR)/2).toFixed(1)}" y="${H-10}" text-anchor="middle" style="font-size:11px">urutan fill (1 &#8211; ${n-1})</text>`;
 
-  // Area di bawah garis -- memperjelas arah, hijau di atas impas / merah di bawah
-  const garis = titik.map((p,i) => (i?"L":"M") + px(p.t).toFixed(1) + " " + py(p.v).toFixed(1)).join(" ");
-  const area = `M ${px(xs[0]).toFixed(1)} ${y0.toFixed(1)} `
-             + titik.map(p => "L " + px(p.t).toFixed(1) + " " + py(p.v).toFixed(1)).join(" ")
-             + ` L ${px(xs[xs.length-1]).toFixed(1)} ${y0.toFixed(1)} Z`;
+  const garis = titik.map((p,i) => (i?"L":"M") + px(i).toFixed(1) + " " + py(p.v).toFixed(1)).join(" ");
+  const area = `M ${px(0).toFixed(1)} ${y0.toFixed(1)} `
+             + titik.map((p,i) => "L " + px(i).toFixed(1) + " " + py(p.v).toFixed(1)).join(" ")
+             + ` L ${px(n-1).toFixed(1)} ${y0.toFixed(1)} Z`;
 
-  // Titik tiap fill -- 12 fill semalam kalau tidak ditandai terlihat seperti
-  // garis patah acak; dengan titik, jelas tiap patahan = satu transaksi.
-  const noktah = titik.map((p,i) =>
-    `<circle cx="${px(p.t).toFixed(1)}" cy="${py(p.v).toFixed(1)}" r="${i===titik.length-1?4.5:2.6}"
-       fill="${i===titik.length-1?warna:"var(--bg)"}" stroke="${warna}" stroke-width="1.6"/>`).join("");
+  // Titik per fill HANYA kalau jumlahnya sedikit. Di atas 80 fill,
+  // titik-titik itu saling menempel dan justru menutupi garisnya.
+  const noktah = n <= 80
+    ? titik.map((p,i) => `<circle cx="${px(i).toFixed(1)}" cy="${py(p.v).toFixed(1)}" r="2.4"
+        fill="var(--bg)" stroke="${warna}" stroke-width="1.4"/>`).join("")
+    : "";
+
+  // Penanda puncak / lembah / akhir -- tiga angka yang paling dicari
+  function tanda(i, v, label, warnaT, atas) {
+    const x = px(i), y = py(v);
+    return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4" fill="${warnaT}"/>`
+         + `<text x="${x.toFixed(1)}" y="${(atas ? y-10 : y+16).toFixed(1)}" text-anchor="middle"
+              style="fill:${warnaT};font-weight:600">${label}</text>`;
+  }
+  let penanda = "";
+  if (n > 2) {
+    penanda += tanda(iPuncak, puncak, (puncak>=0?"+":"")+puncak.toFixed(1), "var(--hijau)", true);
+    penanda += tanda(iLembah, lembah, (lembah>=0?"+":"")+lembah.toFixed(1), "var(--merah)", false);
+  }
+  penanda += tanda(n-1, akhir, (akhir>=0?"+":"")+akhir.toFixed(1), warna, akhir >= puncak*0.98);
 
   return `<svg class="kurva" viewBox="0 0 ${W} ${H}" role="img" aria-label="Kurva P&amp;L kumulatif bersih">
       ${bantu}
-      <path d="${area}" fill="${warna}" opacity="0.12"/>
-      <path class="garis" style="stroke:${warna}" d="${garis}"/>
-      ${noktah}
+      <path d="${area}" fill="${warna}" opacity="0.10"/>
+      <path class="garis" style="stroke:${warna};stroke-width:1.8" d="${garis}"/>
+      ${noktah}${penanda}
     </svg>
-    <div class="grid" style="margin-top:14px">
+    <div class="grid" style="margin-top:16px">
       <div class="item"><div class="label">Posisi akhir</div>
         <div class="val" style="color:${warna}">${akhir>=0?"+":""}${akhir.toFixed(2)} USDT</div></div>
       <div class="item"><div class="label">Puncak tertinggi</div>
-        <div class="val">${puncak>=0?"+":""}${puncak.toFixed(2)}</div></div>
+        <div class="val">${puncak>=0?"+":""}${puncak.toFixed(2)}</div>
+        <div class="note">fill ke-${iPuncak}</div></div>
       <div class="item"><div class="label">Titik terendah</div>
-        <div class="val">${lembah>=0?"+":""}${lembah.toFixed(2)}</div></div>
+        <div class="val">${lembah>=0?"+":""}${lembah.toFixed(2)}</div>
+        <div class="note">fill ke-${iLembah}</div></div>
       <div class="item"><div class="label">Turun dari puncak</div>
-        <div class="val ${(puncak-akhir)>0?"merah-t":""}">${(puncak-akhir).toFixed(2)}</div></div>
-      <div class="item"><div class="label">Jumlah fill</div><div class="val">${titik.length-1}</div></div>
-      ${porto && porto.pct!==null ? `<div class="item"><div class="label">Terhadap modal</div>
+        <div class="val ${(puncak-akhir)>0.005?"merah-t":""}">${(puncak-akhir).toFixed(2)}</div></div>
+      <div class="item"><div class="label">Jumlah fill</div><div class="val">${n-1}</div></div>
+      ${porto && porto.pct!==null && porto.pct!==undefined ? `<div class="item"><div class="label">Terhadap modal</div>
         <div class="val ${porto.pct>=0?"hijau-t":"merah-t"}">${porto.pct>=0?"+":""}${(porto.pct*100).toFixed(3)}%</div></div>` : ""}
     </div>
-    <div class="sub" style="margin-top:10px">Tiap titik = satu fill. Nilainya realized P&amp;L
-      dikurangi fee, definisi sama dengan kartu BERSIH di bawah.
+    <div class="sub" style="margin-top:10px">Sumbu mendatar = urutan fill, bukan waktu &mdash;
+      supaya jeda panjang antar sesi tidak meratakan kurvanya. Nilai = realized P&amp;L dikurangi fee.
       ${porto && porto.asumsi ? "<br>Persentase: " + porto.asumsi + "." : ""}</div>`;
 }
 
