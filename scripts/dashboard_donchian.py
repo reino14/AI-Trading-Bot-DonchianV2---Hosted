@@ -626,7 +626,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="f"><label>Poll TP (detik)</label><input id="c_poll" type="number" step="1" value="1"></div>
     </div>
     <div class="baris">
-      <label class="cek"><input type="checkbox" id="c_stopafter" checked> Berhenti total setelah take profit</label>
+      <label class="cek">Setelah take profit:
+        <select id="c_mode_tp" onchange="ketModeTp()" style="padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--fg);font-size:13px;font-family:inherit">
+          <option value="sekali" selected>Sekali saja &mdash; bot berhenti</option>
+          <option value="berulang">Berulang &mdash; bot lanjut trading</option>
+        </select></label>
+      <span class="sub" id="ket_mode_tp" style="font-size:11px"></span>
       <button class="pri" id="btn_start" onclick="mulai()">Mulai bot</button>
       <button class="bahaya" id="btn_stop" onclick="hentikan()">Hentikan (ala Ctrl+C)</button>
       <span id="pesan" class="sub"></span>
@@ -647,7 +652,7 @@ function konfig() {
     lookback: +pilih("c_lookback").value, amount: +pilih("c_amount").value,
     session_hours: +pilih("c_session").value || null,
     take_profit_pct: +pilih("c_tp").value || null,
-    stop_after_take_profit: pilih("c_stopafter").checked,
+    stop_after_take_profit: pilih("c_mode_tp").value === "sekali",
     backfill_bars: +pilih("c_backfill").value || null,
     live_take_profit_poll_seconds: +pilih("c_poll").value || null,
   };
@@ -787,10 +792,34 @@ function gambarKurva(titik, porto) {
   }
   penanda += tanda(n-1, akhir, (akhir>=0?"+":"")+akhir.toFixed(1), warna, akhir >= puncak*0.98);
 
-  // Koordinat tiap titik ditanam sebagai data atribut supaya pasangHover()
-  // tidak perlu menghitung ulang geometri -- satu sumber kebenaran.
-  const dataTitik = JSON.stringify(titik.map((p,i) => [
-    +px(i).toFixed(1), +py(p.v).toFixed(1), p.v, p.t]));
+  // Titik hover DIBULATKAN ke rentang, tidak satu per satu fill.
+  //
+  // Alasannya: di 385 fill, jarak antar titik cuma ~2 piksel. Menyorot
+  // satu fill berarti angkanya melompat tiap gerakan kecil mouse, dan
+  // "fill ke-237" juga tidak berarti apa-apa bagi pembaca non-teknis.
+  // Dengan dikelompokkan jadi maksimal 40 rentang, tiap hover memberi
+  // satu periode yang jelas: kapan, berapa hasilnya, berubah berapa.
+  //
+  // Garis kurvanya TETAP digambar dari seluruh titik -- yang dibulatkan
+  // hanya titik berhentinya hover, bukan bentuk grafiknya.
+  const MAKS_RENTANG = 40;
+  const lebarKel = Math.max(1, Math.ceil((n - 1) / MAKS_RENTANG));
+  const hover = [];
+  for (let mulai = 0; mulai < n; mulai += lebarKel) {
+    const habis = Math.min(mulai + lebarKel - 1, n - 1);
+    const sebelum = mulai === 0 ? titik[0].v : titik[mulai - 1].v;
+    hover.push([
+      +px(habis).toFixed(1),            // 0 x
+      +py(titik[habis].v).toFixed(1),   // 1 y
+      titik[habis].v,                   // 2 nilai di akhir rentang
+      titik[mulai].t,                   // 3 waktu mulai
+      titik[habis].t,                   // 4 waktu selesai
+      titik[habis].v - sebelum,         // 5 perubahan dalam rentang
+      habis - mulai + 1,                // 6 jumlah transaksi
+    ]);
+    if (habis === n - 1) break;
+  }
+  const dataTitik = JSON.stringify(hover);
 
   return `<svg id="svg_kurva" class="kurva" viewBox="0 0 ${W} ${H}"
       data-titik='${dataTitik}' data-plot="${padL},${W-padR},${padT},${H-padB}"
@@ -807,6 +836,7 @@ function gambarKurva(titik, porto) {
         <rect id="tip_kotak" rx="5" fill="var(--bg)" stroke="var(--line)" stroke-width="1"/>
         <text id="tip_baris1" style="font-size:12px;font-weight:600;fill:var(--fg)"></text>
         <text id="tip_baris2" style="font-size:10.5px;fill:var(--muted)"></text>
+        <text id="tip_baris3" style="font-size:10.5px;font-weight:600"></text>
       </g>
       <rect id="tip_area" x="${padL}" y="${padT}" width="${W-padL-padR}" height="${H-padT-padB}"
         fill="transparent" style="cursor:crosshair"/>
@@ -843,7 +873,8 @@ function pasangHover() {
   const [plotKiri, plotKanan, plotAtas, plotBawah] = svg.dataset.plot.split(",").map(Number);
   const W = svg.viewBox.baseVal.width;
   const g = pilih("tip_g"), garis = pilih("tip_garis"), bulat = pilih("tip_bulat");
-  const kotak = pilih("tip_kotak"), b1 = pilih("tip_baris1"), b2 = pilih("tip_baris2");
+  const kotak = pilih("tip_kotak"), b1 = pilih("tip_baris1"), b2 = pilih("tip_baris2"),
+        b3 = pilih("tip_baris3");
 
   function posisikan(ev) {
     // Lebar tampil SVG berubah mengikuti layar, sementara koordinat di
@@ -857,18 +888,27 @@ function pasangHover() {
       const d = Math.abs(titik[i][0] - x);
       if (d < jarak) { jarak = d; terdekat = i; }
     }
-    const [tx, ty, nilai, waktu] = titik[terdekat];
+    const [tx, ty, nilai, tMulai, tSelesai, delta, jumlahTx] = titik[terdekat];
 
     garis.setAttribute("x1", tx); garis.setAttribute("x2", tx);
     bulat.setAttribute("cx", tx); bulat.setAttribute("cy", ty);
 
-    const teks1 = (nilai >= 0 ? "+" : "") + nilai.toFixed(2) + " USDT";
-    const teks2 = "fill ke-" + terdekat + " \u00b7 " +
-      new Date(waktu).toLocaleString("id-ID", {day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit"});
-    b1.textContent = teks1; b2.textContent = teks2;
+    // Angka dibulatkan 2 desimal dengan pemisah ribuan gaya Indonesia --
+    // pembacanya manajemen, bukan orang yang terbiasa baca angka mentah.
+    const rupiahkan = v => (v >= 0 ? "+" : "\u2212") +
+      Math.abs(v).toLocaleString("id-ID", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    const jam = ms => new Date(ms).toLocaleString("id-ID",
+      {day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit"});
 
-    const lebar = Math.max(teks1.length * 7.6, teks2.length * 5.6) + 20;
-    const tinggi = 40;
+    const teks1 = rupiahkan(nilai) + " USDT";
+    const periode = (tMulai === tSelesai) ? jam(tSelesai) : jam(tMulai) + " \u2013 " + jam(tSelesai);
+    const teks2 = periode;
+    const teks3 = rupiahkan(delta) + " pada periode ini \u00b7 " + jumlahTx +
+      (jumlahTx > 1 ? " transaksi" : " transaksi");
+    b1.textContent = teks1; b2.textContent = teks2; b3.textContent = teks3;
+
+    const lebar = Math.max(teks1.length * 7.8, teks2.length * 5.8, teks3.length * 5.8) + 22;
+    const tinggi = 56;
     // Balik ke kiri kalau mepet tepi kanan, supaya kotaknya tidak terpotong.
     let kx = tx + 14;
     if (kx + lebar > plotKanan) kx = tx - 14 - lebar;
@@ -877,8 +917,10 @@ function pasangHover() {
 
     kotak.setAttribute("x", kx); kotak.setAttribute("y", ky);
     kotak.setAttribute("width", lebar); kotak.setAttribute("height", tinggi);
-    b1.setAttribute("x", kx + 10); b1.setAttribute("y", ky + 17);
-    b2.setAttribute("x", kx + 10); b2.setAttribute("y", ky + 32);
+    b1.setAttribute("x", kx + 11); b1.setAttribute("y", ky + 19);
+    b2.setAttribute("x", kx + 11); b2.setAttribute("y", ky + 34);
+    b3.setAttribute("x", kx + 11); b3.setAttribute("y", ky + 48);
+    b3.style.fill = delta >= 0 ? "var(--hijau)" : "var(--merah)";
     g.style.display = "";
   }
 
@@ -889,6 +931,15 @@ function pasangHover() {
   area.addEventListener("touchmove", ev => {
     if (ev.touches[0]) posisikan(ev.touches[0]);
   }, {passive: true});
+}
+
+// Keterangan satu baris di samping pilihan mode, supaya jelas akibatnya
+// sebelum bot dijalankan.
+function ketModeTp() {
+  const el = pilih("ket_mode_tp"); if (!el) return;
+  el.textContent = pilih("c_mode_tp").value === "sekali"
+    ? "TP kena \u2192 posisi ditutup \u2192 bot mati."
+    : "TP kena \u2192 posisi ditutup \u2192 bot menunggu sinyal berbalik, lalu masuk lagi.";
 }
 
 function render(d) {
@@ -920,7 +971,9 @@ function render(d) {
   const c = d.channel;
   h += `<h2>Status</h2><div class="panel"><div class="grid">
     <div class="item"><div class="label">Proses bot</div><div class="val">
-      <span class="chip ${b.running?"on":"off"}">${b.running?"JALAN":"MATI"}</span></div></div>
+      <span class="chip ${b.running?"on":"off"}">${b.running?"JALAN":"MATI"}</span></div>
+      <div class="note">${b.running && b.cmd ? (b.cmd.includes("--stop-after-take-profit")
+        ? "mode: sekali saja" : "mode: berulang") : ""}</div></div>
     <div class="item"><div class="label">Posisi di bursa</div><div class="val ${
       d.position?(d.position.side==="long"?"hijau-t":"merah-t"):""}">${
       d.position ? d.position.side.toUpperCase()+" "+d.position.contracts : "KOSONG"}</div></div>
@@ -1034,6 +1087,8 @@ function render(d) {
   const lb = pilih("logbox");
   if (lb) lb.scrollTop = lb.scrollHeight;
 }
+
+ketModeTp();
 
 async function muat() {
   try {
