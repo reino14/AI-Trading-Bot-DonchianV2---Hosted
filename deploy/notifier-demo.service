@@ -1,0 +1,17 @@
+# Salin ke /etc/systemd/system/notifier-demo.service
+[Unit]
+Description=Notifier Gmail Bot Donchian (Demo)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=Trabarei
+WorkingDirectory=/home/Trabarei/test
+EnvironmentFile=/etc/donchian/notifier-demo.env
+# Venv bot yang sudah ada: notifier tidak butuh pustaka tambahan.
+ExecStart=/home/Trabarei/test/.venv/bin/python -u -m scripts.notifier_email
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
