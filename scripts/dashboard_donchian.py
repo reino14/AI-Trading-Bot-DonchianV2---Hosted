@@ -222,6 +222,87 @@ def hitung_pertumbuhan(wallet: float | None, net: float) -> dict | None:
     }
 
 
+def _angka(v) -> float | None:
+    """float() yang tidak meledak untuk None / "" / teks aneh dari bursa."""
+    if v in (None, ""):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def hitung_pnl_berjalan(raw_positions: list[dict], position: dict | None,
+                        last_price: float | None, fee_pct: float) -> dict | None:
+    """
+    Untung/rugi posisi yang MASIH TERBUKA (belum direalisasi). FUNGSI MURNI.
+
+    Angka utama diambil dari BURSA (unrealizedPnl + markPrice di objek
+    posisi ccxt), bukan dihitung sendiri -- supaya persis sama dengan
+    yang tampil di aplikasi Binance. Binance menghitungnya dari MARK
+    price, bukan harga transaksi terakhir, jadi hitungan sendiri dari
+    "last" bisa beda beberapa sen/dolar.
+
+    Kalau bursa tidak mengirim angka itu, baru dihitung sendiri dari
+    mark price (atau harga terakhir kalau mark juga kosong), dan
+    'sumber' ditandai supaya tampilan bisa memberi tahu.
+
+    roi_pct memakai definisi yang SAMA dengan Binance: PnL dibagi margin
+    awal, dan margin awal = entry x jumlah / leverage.
+
+    bersih_setelah_fee = PERKIRAAN kalau posisi ditutup SEKARANG:
+    PnL dikurangi fee buka (sudah terbayar) dan fee tutup (akan dibayar).
+    Binance sendiri TIDAK memotong fee di angka PnL-nya, jadi angka ini
+    selalu lebih kecil dari yang tampil di Binance.
+    """
+    if not position:
+        return None
+    qty = abs(_angka(position.get("contracts")) or 0.0)
+    entry = _angka(position.get("entry_price"))
+    lev = _angka(position.get("leverage"))
+    side = position.get("side")
+    if not qty or not entry or side not in ("long", "short"):
+        return None
+    arah = 1 if side == "long" else -1
+
+    mentah = None
+    for p in raw_positions or []:
+        if abs(_angka(p.get("contracts")) or 0.0) > 0:
+            mentah = p
+            break
+    info = (mentah or {}).get("info") or {}
+
+    mark = _angka((mentah or {}).get("markPrice"))
+    if mark is None:
+        mark = _angka(info.get("markPrice"))
+    harga_acuan = mark if mark is not None else last_price
+    acuan = "mark price" if mark is not None else "harga terakhir"
+
+    pnl = _angka((mentah or {}).get("unrealizedPnl"))
+    if pnl is None:
+        pnl = _angka(info.get("unRealizedProfit"))
+    sumber = "bursa"
+    if pnl is None:
+        if harga_acuan is None:
+            return None
+        pnl = arah * (harga_acuan - entry) * qty
+        sumber = "dihitung"
+
+    margin_awal = entry * qty / lev if lev else None
+    fee_buka = entry * qty * fee_pct
+    fee_tutup = (harga_acuan if harga_acuan is not None else entry) * qty * fee_pct
+    return {
+        "side": side, "qty": qty, "entry": entry, "leverage": lev,
+        "harga_acuan": harga_acuan, "acuan": acuan,
+        "gerak_harga_pct": (arah * (harga_acuan - entry) / entry) if harga_acuan else None,
+        "pnl": pnl, "sumber": sumber,
+        "margin_awal": margin_awal,
+        "roi_pct": (pnl / margin_awal) if margin_awal else None,
+        "fee_pct": fee_pct, "fee_total": fee_buka + fee_tutup,
+        "bersih_setelah_fee": pnl - fee_buka - fee_tutup,
+    }
+
+
 def build_equity_curve(raw_trades: list[dict]) -> list[dict]:
     """
     Kurva P&L KUMULATIF BERSIH dari daftar fill. FUNGSI MURNI.
@@ -427,6 +508,9 @@ class DashboardState:
         self.snapshot: dict = {"status": "memuat", "last_error": None, "last_update": None}
         self.trades: list[dict] = []
         self._broker = None
+        # Fee taker per simbol, diambil SEKALI dari akun lalu disimpan --
+        # tidak perlu ditanyakan ke bursa tiap refresh.
+        self._fee_cache: dict[str, float] = {}
 
     def set_params(self, symbol: str, lookback: int, timeframe: str) -> None:
         with self.lock:
@@ -439,6 +523,20 @@ class DashboardState:
             from src.execution.broker import Broker
             self._broker = Broker(exchange_id="binanceusdm", testnet=True)
         return self._broker
+
+    #: Dipakai kalau bursa tidak memberi tahu fee taker akun -- sama dengan
+    #: fallback di paper.py dan sama dengan fee prod yang sudah terkonfirmasi.
+    FEE_FALLBACK = 0.0005
+
+    def _fee_taker(self, broker, symbol: str) -> float:
+        if symbol not in self._fee_cache:
+            fee = None
+            try:
+                fee = broker.fetch_trading_fee_pct(symbol)
+            except Exception:
+                fee = None
+            self._fee_cache[symbol] = fee if fee is not None else self.FEE_FALLBACK
+        return self._fee_cache[symbol]
 
     def refresh_once(self) -> None:
         try:
@@ -475,6 +573,19 @@ class DashboardState:
             if margin_dipakai is not None and wallet > 0:
                 margin_pct = margin_dipakai / wallet
 
+            # Untung/rugi posisi berjalan. Pakai objek posisi MENTAH dari ccxt
+            # (bukan broker.fetch_position) karena hanya objek mentah yang
+            # membawa unrealizedPnl dan markPrice. Gagal di sini TIDAK boleh
+            # menggagalkan seluruh refresh -- angka lain tetap ditampilkan.
+            pnl_berjalan = None
+            if position:
+                try:
+                    raw_positions = broker.exchange.fetch_positions([symbol])
+                except Exception:
+                    raw_positions = []
+                pnl_berjalan = hitung_pnl_berjalan(
+                    raw_positions, position, price, self._fee_taker(broker, symbol))
+
             bars = broker.fetch_recent_bars(symbol, timeframe, limit=lookback + 1)
             channel = compute_channel([b["close"] for b in bars], lookback)
 
@@ -491,6 +602,7 @@ class DashboardState:
                     "used": used, "notional": notional, "margin_est": margin_est,
                     "margin_dipakai": margin_dipakai, "margin_pct": margin_pct,
                     "position": position, "channel": channel,
+                    "pnl_berjalan": pnl_berjalan,
                     "history_days": self.history_days,
                     "n_trades_loaded": len(trades),
                     "oldest_trade": trades[0].get("datetime") if trades else None,
@@ -568,6 +680,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(145px,1fr)); gap:18px 14px; }
   .item .label { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
   .item .val { font-size:18px; font-weight:600; margin-top:4px; font-variant-numeric:tabular-nums; }
+  .item .note { font-size:12px; color:var(--muted); margin-top:4px; line-height:1.4; }
   .hijau-t{color:var(--hijau)} .merah-t{color:var(--merah)} .kuning-t{color:var(--kuning)} .biru-t{color:var(--biru)}
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted);
@@ -598,7 +711,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .chip { display:inline-block; padding:2px 9px; border-radius:20px; font-size:11px; font-weight:600; }
   .chip.on { background:rgba(21,128,61,.15); color:var(--hijau); }
   .chip.off { background:rgba(185,28,28,.15); color:var(--merah); }
-  .kurva { width:100%; max-width:980px; height:auto; display:block; margin:0 auto; }
+  .kurva { width:100%; height:auto; display:block; margin:0; }
   .kurva .garis { fill:none; stroke:var(--biru); stroke-width:2; }
   .kurva .nol { stroke:var(--muted); stroke-width:1; stroke-dasharray:3 3; opacity:.55; }
   .kurva .sumbu { stroke:var(--line); stroke-width:1; }
@@ -731,7 +844,7 @@ function gambarKurva(titik, porto) {
     return `<div class="sub">Belum ada transaksi di rentang ini.</div>`;
   }
   const n = titik.length;
-  const W = 980, H = 330, padL = 78, padR = 26, padT = 26, padB = 56;
+  const W = 1200, H = 340, padL = 78, padR = 26, padT = 26, padB = 56;
   const ys = titik.map(p => p.v);
   let lo = Math.min(...ys, 0), hi = Math.max(...ys, 0);
   if (hi === lo) hi = lo + 1;
@@ -990,6 +1103,37 @@ function render(d) {
         ? (d.porto.net>=0?"+":"")+d.porto.net.toFixed(2)+" USDT dari modal "+d.porto.modal_awal.toFixed(2)
         : "belum ada data saldo"}</div></div>
   </div></div>`;
+
+  // ---- Posisi berjalan: untung/rugi yang BELUM direalisasi ----
+  // Angka utama disamakan dengan yang tampil di aplikasi Binance, supaya
+  // tidak perlu membuka Binance hanya untuk mengecek posisi sedang untung
+  // atau rugi.
+  const pb = d.pnl_berjalan;
+  const ang = v => { const dp = Math.abs(v) < 1 ? 3 : 2;
+    return (v >= 0 ? "+" : "\u2212") + Math.abs(v).toFixed(dp); };
+  const wr = v => v >= 0 ? "hijau-t" : "merah-t";
+  h += `<h2>Posisi berjalan &mdash; untung/rugi saat ini</h2><div class="panel">`;
+  if (!d.position) {
+    h += `<div class="sub">Tidak ada posisi terbuka.</div>`;
+  } else if (!pb) {
+    h += `<div class="sub">Ada posisi terbuka, tapi data untung/rugi belum bisa diambil dari bursa.</div>`;
+  } else {
+    h += `<div class="grid">
+      <div class="item"><div class="label">Untung / rugi</div>
+        <div class="val ${wr(pb.pnl)}" style="font-size:24px">${ang(pb.pnl)} USDT</div>
+        <div class="note">${pb.sumber === "bursa" ? "seperti di Binance" : "dihitung dashboard"} &middot; sebelum fee</div></div>
+      <div class="item"><div class="label">ROI terhadap margin</div>
+        <div class="val ${wr(pb.pnl)}">${pb.roi_pct !== null ? (pb.roi_pct >= 0 ? "+" : "\u2212") + Math.abs(pb.roi_pct * 100).toFixed(2) + "%" : "&mdash;"}</div>
+        <div class="note">margin ${pb.margin_awal ? pb.margin_awal.toFixed(2) : "?"} USDT${pb.leverage ? " &middot; " + pb.leverage.toFixed(0) + "x" : ""}</div></div>
+      <div class="item"><div class="label">Kalau ditutup sekarang</div>
+        <div class="val ${wr(pb.bersih_setelah_fee)}">${ang(pb.bersih_setelah_fee)} USDT</div>
+        <div class="note">perkiraan setelah fee ${pb.fee_total.toFixed(3)} USDT</div></div>
+      <div class="item"><div class="label">Pergerakan harga</div>
+        <div class="val">${pb.gerak_harga_pct !== null ? ang(pb.gerak_harga_pct * 100) + "%" : "&mdash;"}</div>
+        <div class="note">${pb.side.toUpperCase()} ${pb.entry.toFixed(2)} &rarr; ${pb.harga_acuan ? pb.harga_acuan.toFixed(2) : "?"} (${pb.acuan})</div></div>
+    </div>`;
+  }
+  h += `</div>`;
 
   h += `<h2>Batas breakout &mdash; channel Donchian</h2><div class="panel">`;
   if (!c) {
