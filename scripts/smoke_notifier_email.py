@@ -63,7 +63,7 @@ def test_reconstruction():
           abs(c["net"] - (0.591 - 2.4287505)) < 1e-9, f"{c['net']:.7f}")
     subj, body = ne.format_event(c, "DEMO", "BTC/USDT:USDT", 20.0, 0.004)
     check("subjek email menyebut RUGI dan angkanya", "RUGI" in subj and "-1.8378" in subj, subj)
-    check("isi email jujur soal alasan penutupan yang tidak diketahui", "tidak mencatat ALASAN" in body)
+    check("tanpa log dashboard: alasan ditulis jujur 'tidak diketahui'", "tidak diketahui" in body)
 
     print("\n== 3. DATA NYATA: 12 fill 20-21 Sep -> 6 trade utuh ==")
     seq = [("buy", .005, 80836.5), ("sell", .005, 80965.7), ("sell", .01, 80968.4), ("buy", .01, 80848.7),
@@ -250,11 +250,119 @@ def test_gmail():
     FakeSMTP.auth_fail = False
 
 
+# Baris log ASLI dari sesi bot sebelumnya (disalin dari terminal Nero).
+L_HB = "  [heartbeat] 2026-09-17 01:24 UTC  close=76467.90  posisi=0  sinyal=1"
+L_OPEN = "  [signal] posisi 0 -> 1, kirim order buy"
+L_TP = ("  [take-profit] posisi 1 ROI BERSIH >= 0.5% (ekstrem bar 76597.40, ROI kotor 2.39% - "
+        "estimasi fee bolak-balik 1.60% = BERSIH 0.79%) -- TUTUP PAKSA.")
+L_TP_RT = ("  [price-watch][take-profit] posisi 1 ROI BERSIH >= 0.5% (harga LIVE 76589.90, BERSIH 0.59%) "
+           "-- TUTUP PAKSA REAL-TIME, tidak menunggu candle tutup.")
+L_CLOSE = "  [signal] posisi 1 -> 0, kirim order sell (reduceOnly)"
+L_REV = "  [signal] posisi 1 -> 0 (tujuan akhir -1, butuh 1 langkah lagi), kirim order sell (reduceOnly)"
+L_BELUM = ("  [take-profit] Order penutup TERKIRIM tapi BELUM terkonfirmasi flat (posisi masih 1) -- "
+           "AKAN DICOBA LAGI bar berikutnya, BELUM berhenti trading.")
+L_TAHAN = "  [take-profit] sinyal masih arah 1, arah yang BARU SAJA di-take-profit -- DITAHAN, tunggu sinyal benar-benar berbalik dulu."
+
+
+def test_dashboard_reason():
+    print("\n== 10. Alasan penutupan dari log bot di dashboard ==")
+    log = {"lines": [L_HB, L_OPEN]}
+    down = {"v": False}
+    urls = []
+
+    def fetch(url):
+        urls.append(url)
+        if down["v"]:
+            raise OSError("dashboard mati")
+        return {"bot": {"log": list(log["lines"])}}
+
+    d = ne.DashboardLog("http://127.0.0.1:8100/api", fetch=fetch)
+    d.poll(1000)
+    check("putaran pertama cuma jadi patokan (log lama tidak dianggap kejadian)", d.reason(1000) is None)
+    check("dashboard diminta memfilter dari 'sekarang' (hemat kerja)", "from_ms=1000" in urls[-1], urls[-1])
+
+    log["lines"] += [L_BELUM, L_TAHAN]
+    d.poll(2000)
+    check("baris mirip tapi bukan pemicu -> tidak ada alasan", d.reason(2000) is None)
+
+    log["lines"] += [L_TP, L_CLOSE]
+    d.poll(3000)
+    check("take profit + order penutup -> TAKE PROFIT (bukan reversal)", d.reason(3000) == "TAKE PROFIT")
+    check("alasan dipakai sekali saja", d.reason(3001) is None)
+
+    log["lines"] += [L_TP_RT, L_CLOSE]
+    d.poll(4000)
+    check("take profit REAL-TIME juga terbaca", d.reason(4000) == "TAKE PROFIT")
+
+    log["lines"] += [L_REV]
+    d.poll(5000)
+    check("order penutup tanpa take profit -> REVERSAL SINYAL", d.reason(5000) == "REVERSAL SINYAL")
+
+    log["lines"] += [L_REV]
+    d.poll(6000)
+    t_lewat = 6000 + ne.REASON_TTL_MS + 1
+    check("tanda kedaluwarsa setelah 10 menit", d.reason(t_lewat) is None)
+
+    log["lines"] = [L_HB]  # bot di-restart: log dikosongkan dashboard
+    d.poll(t_lewat + 1000)
+    check("log mengecil (bot restart) bukan kejadian", d.reason(t_lewat + 1000) is None)
+
+    log["lines"] += [L_REV]  # setelah restart, kejadian baru tetap terbaca
+    d.poll(t_lewat + 2000)
+    check("setelah log mengecil, kejadian baru tetap terdeteksi", d.reason(t_lewat + 2000) == "REVERSAL SINYAL")
+
+    down["v"] = True
+    d.poll(t_lewat + 3000)
+    check("dashboard mati: tidak galat, alasan None", d.reason(t_lewat + 3000) is None and d.reachable is False)
+
+    print("   integrasi dengan pemantau:")
+    clock = {"t": 10_000_000}
+    br, sd = FakeBroker(), FakeSender()
+    down["v"] = False
+    log["lines"] = [L_HB]
+    with tempfile.TemporaryDirectory() as tmp:
+        n = ne.Notifier(br, "BTC/USDT:USDT", Path(tmp) / "s.json", sd, label="DEMO",
+                        fetch_trades=fake_fetch, now_ms=lambda: clock["t"], dashboard=d)
+        with redirect_stdout(io.StringIO()):
+            n.start()
+            t0 = clock["t"]
+            br.exchange.trades.append(raw("i1", t0 + 100, "buy", 0.01, 80000.0, 0.4, order="A1"))
+            br.pos = {"side": "long", "contracts": 0.01, "leverage": 20}
+            clock["t"] = t0 + 30_000
+            n.tick()
+            log["lines"] += [L_TP, L_CLOSE]  # bot memutuskan take profit
+            t1 = clock["t"]
+            br.exchange.trades.append(raw("i2", t1 + 100, "sell", 0.01, 80500.0, 0.4, pnl=5.0, order="A2"))
+            br.pos = None
+            clock["t"] = t1 + 30_000
+            n.tick()
+        subj, body = sd.sent[-1]
+        check("email penutupan menyebut TAKE PROFIT di subjek", "(TAKE PROFIT)" in subj, subj)
+        check("isi email mencantumkan sumber alasannya", "dari log bot di dashboard" in body)
+
+        with redirect_stdout(io.StringIO()):
+            down["v"] = True
+            t2 = clock["t"]
+            br.exchange.trades.append(raw("i3", t2 + 100, "sell", 0.01, 80400.0, 0.4, order="A3"))
+            br.pos = {"side": "short", "contracts": 0.01, "leverage": 20}
+            clock["t"] = t2 + 30_000
+            n.tick()
+            t3 = clock["t"]
+            br.exchange.trades.append(raw("i4", t3 + 100, "buy", 0.01, 80300.0, 0.4, pnl=1.0, order="A4"))
+            br.pos = None
+            clock["t"] = t3 + 30_000
+            n.tick()
+        subj, body = sd.sent[-1]
+        check("dashboard MATI: email penutupan TETAP terkirim", "TUTUP SHORT" in subj, subj)
+        check("... dengan alasan jujur 'tidak diketahui'", "tidak diketahui" in body)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as d:
         test_reconstruction()
         test_notifier(Path(d))
         test_gmail()
+        test_dashboard_reason()
     print("\n" + "=" * 62)
     if FAILURES:
         print(f"GAGAL: {len(FAILURES)} tes -> {FAILURES}")
