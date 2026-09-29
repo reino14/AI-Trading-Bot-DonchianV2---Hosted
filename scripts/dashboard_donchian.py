@@ -771,7 +771,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="f"><label>Amount (BTC)</label><input id="c_amount" type="number" step="0.001" value="0.001" oninput="hitungNotional()">
         <div class="sub" id="ket_amount" style="font-size:11px;margin-top:5px;line-height:1.5">&mdash;</div></div>
       <div class="f"><label>Session (jam)</label><input id="c_session" type="number" step="0.5" value="24"></div>
-      <div class="f"><label>Risk : Reward (x : 1)</label><input id="c_rr" type="number" step="0.5" min="0" value="2" oninput="hitungNotional()"></div>
+      <div class="f"><label>Untung : Rugi (x : 1)</label><input id="c_rr" type="number" step="0.5" min="0" value="2" oninput="hitungNotional()"></div>
       <div class="f"><label>Jarak SL (&times; ATR)</label><input id="c_slatr" type="number" step="0.5" min="0.5" value="2" oninput="hitungNotional()"></div>
       <div class="f"><label>Backfill (bar)</label><input id="c_backfill" type="number" value="200"></div>
     </div>
@@ -882,6 +882,7 @@ function hitungRR() {
     + `(rugi bersih &minus;${p.rugi.toFixed(2)} USDT) &middot; `
     + `<b class="hijau-t">TP +${(p.t*100).toFixed(2)}%</b> (untung bersih +${p.untung.toFixed(2)} USDT). `
     + `Jarak SL dari ${p.pakaiAtr ? k + " &times; ATR" + periodeAtr : "batas bawah fee (ATR lebih kecil)"}; `
+    + `Untung bersih = ${rr} &times; rugi bersih. `
     + `fee ${(feeTerakhir*100).toFixed(3)}%/sisi. Dipasang di BURSA, tetap aktif walau bot mati.`;
 }
 

@@ -96,7 +96,7 @@ def test_command():
 def test_html():
     print("\n== 2. Form dan skrip halaman ==")
     h = dash.HTML_PAGE
-    check("field Risk : Reward & Jarak SL ada", 'id="c_rr"' in h and 'id="c_slatr"' in h)
+    check("field Untung : Rugi & Jarak SL ada", 'id="c_rr"' in h and 'id="c_slatr"' in h)
     check("field Take profit & Poll TP lama sudah dihapus", 'id="c_tp"' not in h and 'id="c_poll"' not in h)
     check("konfig() mengirim risk_reward, tidak take_profit_pct",
           "risk_reward:" in js_function("konfig") and "take_profit_pct" not in js_function("konfig"))
