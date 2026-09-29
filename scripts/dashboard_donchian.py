@@ -59,6 +59,14 @@ IS_WINDOWS = sys.platform == "win32"
 #: permintaan, bukan dikirim sekaligus (akan ditolak/dipotong diam-diam).
 CHUNK_MS = 7 * 24 * 60 * 60 * 1000
 
+#: Periode ATR untuk pratinjau SL di form -- HARUS sama dengan default
+#: --sl-atr-period di run_paper_donchian_futures.py (20), karena bot yang
+#: dijalankan dari form tidak mengirim flag itu.
+ATR_PERIOD = 20
+#: Batas bawah jarak SL (kelipatan fee bolak-balik) -- sama dengan default
+#: --sl-min-fee-mult di launcher.
+SL_MIN_FEE_MULT = 2.0
+
 
 def fetch_all_trades(exchange, symbol: str, since_ms: int, until_ms: int,
                      page_limit: int = 1000, max_pages: int = 200) -> list[dict]:
@@ -386,6 +394,12 @@ def build_bot_command(cfg: dict) -> list[str]:
         cmd += ["--backfill-bars", str(int(cfg["backfill_bars"]))]
     if cfg.get("live_take_profit_poll_seconds"):
         cmd += ["--live-take-profit-poll-seconds", str(float(cfg["live_take_profit_poll_seconds"]))]
+    # SL + TP rasio di bursa. take_profit_pct lama sengaja TIDAK ikut dikirim
+    # bersamaan: launcher menolak kombinasi keduanya.
+    if cfg.get("risk_reward"):
+        cmd += ["--risk-reward", str(float(cfg["risk_reward"]))]
+        if cfg.get("sl_atr_mult"):
+            cmd += ["--sl-atr-mult", str(float(cfg["sl_atr_mult"]))]
     return cmd
 
 
@@ -589,6 +603,27 @@ class DashboardState:
             bars = broker.fetch_recent_bars(symbol, timeframe, limit=lookback + 1)
             channel = compute_channel([b["close"] for b in bars], lookback)
 
+            # Bahan pratinjau SL/TP di form: ATR dengan RUMUS YANG SAMA
+            # dipakai bot (diimpor dari paper.py, bukan disalin), dan fee
+            # taker akun. Gagal di sini tidak boleh menggagalkan refresh.
+            atr = None
+            try:
+                from src.runner.paper import compute_atr
+                atr = compute_atr(bars, ATR_PERIOD)
+            except Exception:
+                atr = None
+            fee_taker = self._fee_taker(broker, symbol)
+
+            # SL/TP yang BENAR-BENAR ada di bursa untuk posisi ini -- supaya
+            # tidak perlu membuka Binance untuk memastikan posisi terlindungi.
+            # None = tidak bisa dibaca (dibedakan dari [] = memang tidak ada).
+            bracket_orders = None
+            if position and hasattr(broker, "fetch_open_conditional_orders"):
+                try:
+                    bracket_orders = broker.fetch_open_conditional_orders(symbol)
+                except Exception:
+                    bracket_orders = None
+
             now_ms = int(time.time() * 1000)
             since_ms = now_ms - self.history_days * 24 * 60 * 60 * 1000
             trades = fetch_all_trades(broker.exchange, symbol, since_ms, now_ms)
@@ -603,6 +638,8 @@ class DashboardState:
                     "margin_dipakai": margin_dipakai, "margin_pct": margin_pct,
                     "position": position, "channel": channel,
                     "pnl_berjalan": pnl_berjalan,
+                    "atr": atr, "atr_period": ATR_PERIOD, "fee_taker": fee_taker,
+                    "bracket_orders": bracket_orders,
                     "history_days": self.history_days,
                     "n_trades_loaded": len(trades),
                     "oldest_trade": trades[0].get("datetime") if trades else None,
@@ -734,10 +771,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="f"><label>Amount (BTC)</label><input id="c_amount" type="number" step="0.001" value="0.001" oninput="hitungNotional()">
         <div class="sub" id="ket_amount" style="font-size:11px;margin-top:5px;line-height:1.5">&mdash;</div></div>
       <div class="f"><label>Session (jam)</label><input id="c_session" type="number" step="0.5" value="24"></div>
-      <div class="f"><label>Take profit (fraksi)</label><input id="c_tp" type="number" step="0.001" value="0.005"></div>
+      <div class="f"><label>Risk : Reward (x : 1)</label><input id="c_rr" type="number" step="0.5" min="0" value="2" oninput="hitungNotional()"></div>
+      <div class="f"><label>Jarak SL (&times; ATR)</label><input id="c_slatr" type="number" step="0.5" min="0.5" value="2" oninput="hitungNotional()"></div>
       <div class="f"><label>Backfill (bar)</label><input id="c_backfill" type="number" value="200"></div>
-      <div class="f"><label>Poll TP (detik)</label><input id="c_poll" type="number" step="1" value="1"></div>
     </div>
+    <div class="sub" id="ket_rr" style="font-size:12px;margin-top:10px;line-height:1.55">&mdash;</div>
     <div class="baris">
       <label class="cek">Setelah take profit:
         <select id="c_mode_tp" onchange="ketModeTp()" style="padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--fg);font-size:13px;font-family:inherit">
@@ -764,10 +802,10 @@ function konfig() {
     symbol: pilih("c_symbol").value, timeframe: pilih("c_timeframe").value,
     lookback: +pilih("c_lookback").value, amount: +pilih("c_amount").value,
     session_hours: +pilih("c_session").value || null,
-    take_profit_pct: +pilih("c_tp").value || null,
+    risk_reward: +pilih("c_rr").value || null,
+    sl_atr_mult: +pilih("c_slatr").value || null,
     stop_after_take_profit: pilih("c_mode_tp").value === "sekali",
     backfill_bars: +pilih("c_backfill").value || null,
-    live_take_profit_poll_seconds: +pilih("c_poll").value || null,
   };
 }
 
@@ -811,6 +849,41 @@ function set7Hari() {
 // refresh, bukan cuma saat diketik.
 let hargaTerakhir = null;
 let leverageTerakhir = null;
+let atrTerakhir = null, feeTerakhir = null, periodeAtr = 20;
+const SL_MIN_FEE_MULT_JS = __SL_MIN_FEE_MULT__;
+
+// Pratinjau SL/TP -- RUMUS SAMA dengan compute_bracket() di paper.py
+// (diuji terhadapnya di smoke test). Semua jarak dalam fraksi harga.
+//   f = 2 x fee satu sisi;  s = maks(k x ATR / harga, batas x f);
+//   t = R x s + (R + 1) x f  -> untung bersih TP = R x rugi bersih SL.
+function pratinjauRR(harga, jumlah, atr, fee, rr, kAtr, batasFee) {
+  const f = 2 * fee;
+  const lantai = batasFee * f;
+  const dAtr = (atr && harga) ? kAtr * atr / harga : null;
+  const pakaiAtr = dAtr !== null && dAtr >= lantai;
+  const s = pakaiAtr ? dAtr : lantai;
+  const t = rr * s + (rr + 1) * f;
+  const nilai = jumlah * harga;
+  return {s, t, pakaiAtr, rugi: nilai * (s + f), untung: nilai * (t - f)};
+}
+
+function hitungRR() {
+  const el = pilih("ket_rr");
+  if (!el) return;
+  const rr = parseFloat(pilih("c_rr").value), k = parseFloat(pilih("c_slatr").value);
+  const amt = parseFloat(pilih("c_amount").value);
+  if (!rr || rr <= 0) {
+    el.innerHTML = "<b>Tanpa SL/TP</b> &mdash; posisi hanya ditutup saat sinyal berbalik.";
+    return;
+  }
+  if (!amt || !hargaTerakhir || feeTerakhir === null) { el.innerHTML = "&mdash;"; return; }
+  const p = pratinjauRR(hargaTerakhir, amt, atrTerakhir, feeTerakhir, rr, k || 2, SL_MIN_FEE_MULT_JS);
+  el.innerHTML = `Kalau masuk sekarang: <b class="merah-t">SL &minus;${(p.s*100).toFixed(2)}%</b> `
+    + `(rugi bersih &minus;${p.rugi.toFixed(2)} USDT) &middot; `
+    + `<b class="hijau-t">TP +${(p.t*100).toFixed(2)}%</b> (untung bersih +${p.untung.toFixed(2)} USDT). `
+    + `Jarak SL dari ${p.pakaiAtr ? k + " &times; ATR" + periodeAtr : "batas bawah fee (ATR lebih kecil)"}; `
+    + `fee ${(feeTerakhir*100).toFixed(3)}%/sisi. Dipasang di BURSA, tetap aktif walau bot mati.`;
+}
 
 // Notional = amount x HARGA TERAKHIR dari bursa (ticker "last"), BUKAN
 // angka karangan. Kalau harga belum termuat, JANGAN tampilkan tebakan --
@@ -828,6 +901,7 @@ function hitungNotional() {
   el.innerHTML = leverageTerakhir
     ? `<b>${notional.toFixed(2)} USDT</b> &middot; margin ${(notional/leverageTerakhir).toFixed(2)}`
     : `<b>${notional.toFixed(2)} USDT</b>`;
+  hitungRR();
 }
 
 // Kurva ekuitas, digambar manual tanpa library.
@@ -1046,6 +1120,35 @@ function pasangHover() {
   }, {passive: true});
 }
 
+// SL/TP yang BENAR-BENAR ada di bursa untuk posisi terbuka. Peringatan
+// merah kalau bot jalan dengan mode SL/TP tapi SL tidak ditemukan --
+// artinya posisi sedang tidak terlindungi.
+function panelSlTp(d, modeSlTp) {
+  const ords = d.bracket_orders;
+  const entry = d.position && d.position.entry_price;
+  if (ords === null || ords === undefined) {
+    return `<div class="sub" style="margin-top:14px">SL/TP di bursa: tidak bisa dibaca saat ini.</div>`;
+  }
+  const sl = ords.find(o => (o.type || "").startsWith("STOP"));
+  const tp = ords.find(o => (o.type || "").startsWith("TAKE_PROFIT"));
+  const jarak = v => (entry && v) ? ((v - entry) / entry * 100) : null;
+  const sel = (label, o, kelas) => {
+    if (!o) return `<div class="item"><div class="label">${label}</div><div class="val">&mdash;</div>
+      <div class="note">tidak ada di bursa</div></div>`;
+    const j = jarak(o.trigger_price);
+    return `<div class="item"><div class="label">${label}</div>
+      <div class="val ${kelas}">${o.trigger_price ? o.trigger_price.toFixed(2) : "?"}</div>
+      <div class="note">${j !== null ? (j >= 0 ? "+" : "\u2212") + Math.abs(j).toFixed(2) + "% dari harga masuk" : ""}</div></div>`;
+  };
+  let h = "";
+  if (!sl && modeSlTp) {
+    h += `<div class="err" style="margin-top:14px"><b>Posisi TIDAK dilindungi stop loss di bursa.</b>
+      Bot berjalan dengan mode SL/TP, tapi order SL tidak ditemukan. Cek log bot di bawah.</div>`;
+  }
+  h += `<div class="grid" style="margin-top:14px">${sel("Stop loss di bursa", sl, "merah-t")}${sel("Take profit di bursa", tp, "hijau-t")}</div>`;
+  return h;
+}
+
 // Keterangan satu baris di samping pilihan mode, supaya jelas akibatnya
 // sebelum bot dijalankan.
 function ketModeTp() {
@@ -1063,7 +1166,11 @@ function render(d) {
   // hidup mengikuti pasar, bukan hanya saat pengguna mengetik.
   if (typeof d.price === "number") hargaTerakhir = d.price;
   leverageTerakhir = (d.position && d.position.leverage) ? d.position.leverage : null;
+  if (typeof d.atr === "number") atrTerakhir = d.atr;
+  if (typeof d.fee_taker === "number") feeTerakhir = d.fee_taker;
+  if (d.atr_period) periodeAtr = d.atr_period;
   hitungNotional();
+  hitungRR();
 
   const b = d.bot || {};
   pilih("btn_start").disabled = !!b.running;
@@ -1082,11 +1189,14 @@ function render(d) {
 
   // ---- Status bot + channel breakout ----
   const c = d.channel;
+  const modeSlTp = !!(b.running && b.cmd && b.cmd.includes("--risk-reward"));
   h += `<h2>Status</h2><div class="panel"><div class="grid">
     <div class="item"><div class="label">Proses bot</div><div class="val">
       <span class="chip ${b.running?"on":"off"}">${b.running?"JALAN":"MATI"}</span></div>
       <div class="note">${b.running && b.cmd ? (b.cmd.includes("--stop-after-take-profit")
-        ? "mode: sekali saja" : "mode: berulang") : ""}</div></div>
+        ? "mode: sekali saja" : "mode: berulang") + (modeSlTp
+        ? " &middot; SL/TP " + (b.cmd.match(/--risk-reward (\S+)/) || [,"?"])[1].replace(/\.0$/, "") + ":1"
+        : " &middot; tanpa SL/TP") : ""}</div></div>
     <div class="item"><div class="label">Posisi di bursa</div><div class="val ${
       d.position?(d.position.side==="long"?"hijau-t":"merah-t"):""}">${
       d.position ? d.position.side.toUpperCase()+" "+d.position.contracts : "KOSONG"}</div></div>
@@ -1133,6 +1243,7 @@ function render(d) {
         <div class="note">${pb.side.toUpperCase()} ${pb.entry.toFixed(2)} &rarr; ${pb.harga_acuan ? pb.harga_acuan.toFixed(2) : "?"} (${pb.acuan})</div></div>
     </div>`;
   }
+  if (d.position) h += panelSlTp(d, modeSlTp);
   h += `</div>`;
 
   h += `<h2>Batas breakout &mdash; channel Donchian</h2><div class="panel">`;
@@ -1249,6 +1360,9 @@ setInterval(muat, 5000);
 </body>
 </html>
 """
+# Batas bawah fee di pratinjau JS diisi dari konstanta Python yang SAMA,
+# supaya tidak bisa diam-diam berbeda dari angka yang dipakai bot.
+HTML_PAGE = HTML_PAGE.replace("__SL_MIN_FEE_MULT__", repr(float(SL_MIN_FEE_MULT)))
 
 
 def make_handler(state: DashboardState, bot: BotProcess):
