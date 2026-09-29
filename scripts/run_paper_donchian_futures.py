@@ -60,6 +60,21 @@ def make_channel_debug_fn(lookback: int):
     return fn
 
 
+def make_channel_fn(lookback: int):
+    """
+    (atas, bawah) channel Donchian untuk mode masuk-lagi "midline" --
+    RUMUS SAMA PERSIS dengan make_channel_debug_fn() di atas dan dengan
+    sinyal: max/min close `lookback` bar SEBELUM bar terakhir.
+    None kalau data belum cukup.
+    """
+    def fn(bars: list[dict]):
+        if len(bars) < lookback + 1:
+            return None
+        window = [b["close"] for b in bars[-(lookback + 1):-1]]
+        return max(window), min(window)
+    return fn
+
+
 async def replay_historical(runner: PaperRunner, n_bars: int, data_dir: str, symbol_file: str) -> None:
     """
     Suapkan bar 1H BTC SUNGGUHAN (yang sudah ditarik sebelumnya untuk
@@ -100,6 +115,9 @@ async def replay_historical(runner: PaperRunner, n_bars: int, data_dir: str, sym
 
 
 def build_runner(args: argparse.Namespace) -> PaperRunner:
+    # getattr: pemanggil lama yang menyusun Namespace sendiri (tanpa field
+    # baru ini) tetap jalan dengan perilaku lama, bukan crash.
+    reentry_mode = getattr(args, "reentry_mode", "reversal")
     params = DonchianCloseFuturesParams(lookback=args.lookback)
     strategy = DonchianCloseFuturesStrategy(params)
     print(f"  (Strategi: {strategy.describe()})")
@@ -119,8 +137,10 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
         print(f"  (SL + TP rasio {args.risk_reward:g}:1 BERSIH setelah fee, dititipkan ke BURSA:")
         print(f"   SL = maks({args.sl_atr_mult:g} x ATR{args.sl_atr_period}, {args.sl_min_fee_mult:g} x fee bolak-balik), "
               f"TP = {args.risk_reward:g} x SL + {args.risk_reward + 1:g} x fee.")
-        print(f"   Setelah TP: {'BERHENTI TOTAL' if args.stop_after_take_profit else 'tahan arah sampai sinyal berbalik'}. "
-              f"Setelah SL: tahan arah sampai sinyal berbalik.)")
+        tahan = ("masuk lagi setelah harga kembali ke tengah channel lalu breakout baru searah"
+                 if reentry_mode == "midline" else "tahan arah sampai sinyal berbalik")
+        print(f"   Setelah TP: {'BERHENTI TOTAL' if args.stop_after_take_profit else tahan}. "
+              f"Setelah SL: {tahan}.)")
 
     return PaperRunner(
         strategy, broker, symbol=args.symbol, timeframe=args.timeframe,
@@ -131,6 +151,8 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
         debug_info_fn=make_channel_debug_fn(args.lookback),
         risk_reward=args.risk_reward, sl_atr_mult=args.sl_atr_mult, sl_atr_period=args.sl_atr_period,
         sl_min_fee_mult=args.sl_min_fee_mult, bracket_poll_seconds=args.bracket_poll_seconds,
+        reentry_mode=reentry_mode,
+        reentry_channel_fn=make_channel_fn(args.lookback) if reentry_mode == "midline" else None,
     )
 
 
@@ -179,6 +201,10 @@ def main() -> None:
     p.add_argument("--bracket-poll-seconds", type=float, default=5.0,
                     help="seberapa sering bot mengecek apakah SL/TP sudah kena, untuk membereskan "
                          "sisa order (eksekusi SL/TP sendiri oleh BURSA, tidak bergantung angka ini)")
+    p.add_argument("--reentry-mode", choices=["reversal", "midline"], default="reversal",
+                    help="setelah posisi ditutup TP/SL, kapan boleh masuk lagi ke arah YANG SAMA: "
+                         "'reversal' (default) = tunggu sinyal berbalik; 'midline' = siap begitu harga "
+                         "kembali ke tengah channel, lalu masuk saat ada breakout baru searah")
     p.add_argument("--replay-historical", type=int, default=None,
                     help="jumlah bar 1H BTC SUNGGUHAN terakhir untuk diputar ulang lewat "
                          "process_bar() di mode --mock -- validasi kuat sebelum --live. "

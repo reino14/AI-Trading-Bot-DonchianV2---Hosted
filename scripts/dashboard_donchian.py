@@ -400,6 +400,8 @@ def build_bot_command(cfg: dict) -> list[str]:
         cmd += ["--risk-reward", str(float(cfg["risk_reward"]))]
         if cfg.get("sl_atr_mult"):
             cmd += ["--sl-atr-mult", str(float(cfg["sl_atr_mult"]))]
+    if cfg.get("reentry_mode") == "midline":
+        cmd += ["--reentry-mode", "midline"]
     return cmd
 
 
@@ -771,7 +773,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="f"><label>Amount (BTC)</label><input id="c_amount" type="number" step="0.001" value="0.001" oninput="hitungNotional()">
         <div class="sub" id="ket_amount" style="font-size:11px;margin-top:5px;line-height:1.5">&mdash;</div></div>
       <div class="f"><label>Session (jam)</label><input id="c_session" type="number" step="0.5" value="24"></div>
-      <div class="f"><label>Untung : Rugi (x : 1)</label><input id="c_rr" type="number" step="0.5" min="0" value="2" oninput="hitungNotional()"></div>
+      <div class="f"><label>Rasio untung</label><input id="c_untung" type="number" step="0.5" min="0" value="2" oninput="hitungNotional()"></div>
+      <div class="f"><label>Rasio rugi</label><input id="c_rugi" type="number" step="0.5" min="0" value="1" oninput="hitungNotional()"></div>
       <div class="f"><label>Jarak SL (&times; ATR)</label><input id="c_slatr" type="number" step="0.5" min="0.5" value="2" oninput="hitungNotional()"></div>
       <div class="f"><label>Backfill (bar)</label><input id="c_backfill" type="number" value="200"></div>
     </div>
@@ -780,7 +783,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <label class="cek">Setelah take profit:
         <select id="c_mode_tp" onchange="ketModeTp()" style="padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--fg);font-size:13px;font-family:inherit">
           <option value="sekali" selected>Sekali saja &mdash; bot berhenti</option>
-          <option value="berulang">Berulang &mdash; bot lanjut trading</option>
+          <option value="tengah">Berulang &mdash; masuk lagi dari tengah channel</option>
+          <option value="berulang">Berulang &mdash; tunggu sinyal berbalik</option>
         </select></label>
       <span class="sub" id="ket_mode_tp" style="font-size:11px"></span>
       <button class="pri" id="btn_start" onclick="mulai()">Mulai bot</button>
@@ -802,9 +806,10 @@ function konfig() {
     symbol: pilih("c_symbol").value, timeframe: pilih("c_timeframe").value,
     lookback: +pilih("c_lookback").value, amount: +pilih("c_amount").value,
     session_hours: +pilih("c_session").value || null,
-    risk_reward: +pilih("c_rr").value || null,
+    risk_reward: rasioUntungRugi(),
     sl_atr_mult: +pilih("c_slatr").value || null,
     stop_after_take_profit: pilih("c_mode_tp").value === "sekali",
+    reentry_mode: pilih("c_mode_tp").value === "tengah" ? "midline" : null,
     backfill_bars: +pilih("c_backfill").value || null,
   };
 }
@@ -867,10 +872,18 @@ function pratinjauRR(harga, jumlah, atr, fee, rr, kAtr, batasFee) {
   return {s, t, pakaiAtr, rugi: nilai * (s + f), untung: nilai * (t - f)};
 }
 
+// Rasio yang dikirim ke bot = untung / rugi (mis. 3 : 2 -> 1.5). Bot hanya
+// butuh satu angka; rumus SL/TP-nya tidak berubah. null = tanpa SL/TP.
+function rasioUntungRugi() {
+  const u = parseFloat(pilih("c_untung").value), r = parseFloat(pilih("c_rugi").value);
+  return (u > 0 && r > 0) ? u / r : null;
+}
+
 function hitungRR() {
   const el = pilih("ket_rr");
   if (!el) return;
-  const rr = parseFloat(pilih("c_rr").value), k = parseFloat(pilih("c_slatr").value);
+  const rr = rasioUntungRugi(), k = parseFloat(pilih("c_slatr").value);
+  const u = pilih("c_untung").value, r = pilih("c_rugi").value;
   const amt = parseFloat(pilih("c_amount").value);
   if (!rr || rr <= 0) {
     el.innerHTML = "<b>Tanpa SL/TP</b> &mdash; posisi hanya ditutup saat sinyal berbalik.";
@@ -882,7 +895,7 @@ function hitungRR() {
     + `(rugi bersih &minus;${p.rugi.toFixed(2)} USDT) &middot; `
     + `<b class="hijau-t">TP +${(p.t*100).toFixed(2)}%</b> (untung bersih +${p.untung.toFixed(2)} USDT). `
     + `Jarak SL dari ${p.pakaiAtr ? k + " &times; ATR" + periodeAtr : "batas bawah fee (ATR lebih kecil)"}; `
-    + `Untung bersih = ${rr} &times; rugi bersih. `
+    + `Untung : rugi = ${u} : ${r}, artinya untung bersih = ${+rr.toFixed(4)} &times; rugi bersih. `
     + `fee ${(feeTerakhir*100).toFixed(3)}%/sisi. Dipasang di BURSA, tetap aktif walau bot mati.`;
 }
 
@@ -1154,9 +1167,12 @@ function panelSlTp(d, modeSlTp) {
 // sebelum bot dijalankan.
 function ketModeTp() {
   const el = pilih("ket_mode_tp"); if (!el) return;
-  el.textContent = pilih("c_mode_tp").value === "sekali"
+  const m = pilih("c_mode_tp").value;
+  el.textContent = m === "sekali"
     ? "TP kena \u2192 posisi ditutup \u2192 bot mati."
-    : "TP kena \u2192 posisi ditutup \u2192 bot menunggu sinyal berbalik, lalu masuk lagi.";
+    : m === "tengah"
+    ? "TP/SL kena \u2192 tunggu harga kembali ke tengah channel \u2192 masuk lagi saat breakout baru searah."
+    : "TP/SL kena \u2192 tunggu sinyal berbalik arah, baru masuk lagi.";
 }
 
 function render(d) {
@@ -1195,7 +1211,8 @@ function render(d) {
     <div class="item"><div class="label">Proses bot</div><div class="val">
       <span class="chip ${b.running?"on":"off"}">${b.running?"JALAN":"MATI"}</span></div>
       <div class="note">${b.running && b.cmd ? (b.cmd.includes("--stop-after-take-profit")
-        ? "mode: sekali saja" : "mode: berulang") + (modeSlTp
+        ? "mode: sekali saja" : (b.cmd.includes("--reentry-mode midline")
+          ? "mode: berulang dari tengah" : "mode: berulang, tunggu berbalik")) + (modeSlTp
         ? " &middot; SL/TP " + (b.cmd.match(/--risk-reward (\S+)/) || [,"?"])[1].replace(/\.0$/, "") + ":1"
         : " &middot; tanpa SL/TP") : ""}</div></div>
     <div class="item"><div class="label">Posisi di bursa</div><div class="val ${

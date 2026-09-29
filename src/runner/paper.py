@@ -148,6 +148,8 @@ class PaperRunner:
         sl_atr_period: int = 20,
         sl_min_fee_mult: float = 2.0,
         bracket_poll_seconds: float = 5.0,
+        reentry_mode: str = "reversal",
+        reentry_channel_fn: Callable[[list[dict]], tuple[float, float] | None] | None = None,
     ):
         self.strategy = strategy
         self.broker = broker
@@ -170,6 +172,22 @@ class PaperRunner:
         self.sl_atr_period = sl_atr_period
         self.sl_min_fee_mult = sl_min_fee_mult
         self.bracket_poll_seconds = bracket_poll_seconds
+        # reentry_mode: kapan boleh masuk lagi ke arah YANG SAMA setelah
+        # posisi ditutup TP/SL (mode berulang):
+        #   "reversal" (default, perilaku lama): tunggu sinyal berbalik.
+        #   "midline": "siap" begitu close kembali ke tengah channel, lalu
+        #              masuk lagi saat close menembus batas channel searah
+        #              (breakout BARU) -- tidak perlu menunggu sisi seberang jebol.
+        # reentry_channel_fn(bars) -> (atas, bawah): WAJIB untuk "midline".
+        # Disuplai launcher dengan rumus channel yang SAMA dengan sinyal,
+        # supaya PaperRunner tetap tidak tahu-menahu soal Donchian.
+        if reentry_mode not in ("reversal", "midline"):
+            raise ValueError(f"reentry_mode tidak dikenal: {reentry_mode!r}")
+        if reentry_mode == "midline" and reentry_channel_fn is None:
+            raise ValueError("reentry_mode='midline' butuh reentry_channel_fn")
+        self.reentry_mode = reentry_mode
+        self.reentry_channel_fn = reentry_channel_fn
+        self._reentry_armed = False
         # debug_info_fn: opsional -- fungsi (bars: list[dict]) -> str,
         # dipanggil tiap heartbeat DAN sekali setelah backfill, hasilnya
         # ditempel di output. PaperRunner TIDAK tahu apa isinya (tetap
@@ -416,16 +434,21 @@ class PaperRunner:
                               "AKTIF, program BERHENTI trading total (restart manual untuk lanjut).")
                     else:
                         self._blocked_direction = triggered_direction
+                        self._reentry_armed = False
                 else:
                     print(f"  [take-profit] Order penutup TERKIRIM tapi BELUM terkonfirmasi flat "
                           f"(posisi masih {self._current_position}) -- AKAN DICOBA LAGI bar berikutnya, "
                           f"BELUM berhenti trading.")
             elif latest_signal != self._current_position:
                 if self._blocked_direction is not None and latest_signal == self._blocked_direction:
-                    print(f"  [take-profit] sinyal masih arah {latest_signal}, arah yang BARU SAJA "
-                          f"di-take-profit -- DITAHAN, tunggu sinyal benar-benar berbalik dulu.")
+                    if self.reentry_mode == "midline":
+                        await self._maybe_reenter(df, latest_signal)
+                    else:
+                        print(f"  [take-profit] sinyal masih arah {latest_signal}, arah yang BARU SAJA "
+                              f"di-take-profit -- DITAHAN, tunggu sinyal benar-benar berbalik dulu.")
                 else:
                     self._blocked_direction = None  # sinyal sudah beda arah -- blokir dicabut
+                    self._reentry_armed = False
                     await self._handle_signal_change(latest_signal, df)
 
         self._check_session_warning(bar_time)
@@ -619,6 +642,7 @@ class PaperRunner:
                           "stop_after_take_profit AKTIF, BERHENTI trading total.")
                 else:
                     self._blocked_direction = triggered_direction
+                    self._reentry_armed = False
             else:
                 print("  [price-watch][take-profit] Order penutup TERKIRIM tapi BELUM terkonfirmasi "
                       "flat -- dicoba lagi poll berikutnya.")
@@ -800,6 +824,7 @@ class PaperRunner:
                       "AKTIF, program BERHENTI trading total (restart manual untuk lanjut).")
             else:
                 self._blocked_direction = direction
+                self._reentry_armed = False
         else:
             if kind == "SL":
                 print(f"  [stop-loss] SL di BURSA KENA (pemicu {b['sl_price']:.2f}, keluar ~{keluar}) "
@@ -808,9 +833,49 @@ class PaperRunner:
                 print("  [stop-loss] posisi TERTUTUP tapi harga keluar tidak terbaca -- "
                       "diperlakukan sebagai STOP LOSS demi keamanan.")
             self._blocked_direction = direction
+            self._reentry_armed = False
             print(f"  [stop-loss] arah {direction} DITAHAN sampai sinyal benar-benar berbalik "
                   f"(tidak langsung masuk lagi ke arah yang baru rugi).")
         return True
+
+    async def _maybe_reenter(self, df: pd.DataFrame, direction: int) -> None:
+        """
+        Mode "midline": arah `direction` sedang diblokir setelah TP/SL.
+          1. Tunggu close KEMBALI ke tengah channel -> status "siap".
+          2. Setelah siap, close menembus batas channel searah (breakout
+             baru) -> blokir dicabut, masuk lagi ke arah itu.
+        Channel dihitung dari `lookback` bar SEBELUM bar ini (rumus yang
+        sama dengan sinyal), jadi "menembus" di sini sama artinya dengan
+        breakout yang memicu sinyal.
+        """
+        try:
+            ch = self.reentry_channel_fn(self._bars)
+        except Exception as e:
+            print(f"  [re-entry] gagal menghitung channel ({e}) -- dicoba lagi bar berikutnya")
+            return
+        if not ch:
+            return
+        atas, bawah = ch
+        tengah = (atas + bawah) / 2
+        close = float(df["close"].iloc[-1])
+        long = direction == Position.LONG
+        arah = "LONG" if long else "SHORT"
+
+        if not self._reentry_armed:
+            if (close <= tengah) if long else (close >= tengah):
+                self._reentry_armed = True
+                batas = atas if long else bawah
+                print(f"  [re-entry] harga {close:.2f} kembali ke tengah channel ({tengah:.2f}) -- SIAP masuk "
+                      f"{arah} lagi begitu close menembus {'atas' if long else 'bawah'} {batas:.2f}.")
+            return
+
+        if (close > atas) if long else (close < bawah):
+            batas = atas if long else bawah
+            print(f"  [re-entry] BREAKOUT BARU searah: close {close:.2f} menembus "
+                  f"{'atas' if long else 'bawah'} {batas:.2f} -- masuk {arah} lagi.")
+            self._blocked_direction = None
+            self._reentry_armed = False
+            await self._handle_signal_change(direction, df)
 
     async def _bracket_watch_loop(self, poll_interval_seconds: float) -> None:
         """
