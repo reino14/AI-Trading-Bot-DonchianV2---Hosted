@@ -20,13 +20,19 @@ KENAPA DARI FILL BURSA, BUKAN DARI LOG BOT
 - Untung bersih per trade dihitung dari angka bursa: jumlah realizedPnl
   DIKURANGI fee SEMUA fill trade itu (fee buka + fee tutup).
 
-BATASAN YANG PERLU DIKETAHUI
+ALASAN PENUTUPAN -- dari log bot di dashboard
 -------------------------------------------------------------------------
-- Bursa tidak mencatat ALASAN penutupan. Notifier tahu posisi ditutup dan
-  berapa hasilnya, tapi tidak bisa membedakan take profit, reversal
-  sinyal, atau penutupan manual. Email mencantumkan ROI bersih terhadap
-  margin dan ambang TP bot (kalau NOTIF_TP_PCT diisi) supaya Anda bisa
-  menilainya sendiri.
+- Bursa tidak mencatat ALASAN penutupan. Kalau NOTIF_DASHBOARD_URL diisi,
+  notifier membaca log bot yang ditangkap dashboard: baris
+  "[take-profit] ... TUTUP PAKSA" -> TAKE PROFIT, baris "[signal] posisi
+  ... reduceOnly" tanpa take profit -> REVERSAL SINYAL, baris
+  "[stop-loss] ... TERTUTUP" -> STOP LOSS (fitur --risk-reward).
+- Dashboard HANYA dipakai untuk alasan. Deteksi posisi tetap dari fill
+  bursa (punya ID order, riwayat lengkap), jadi kalau dashboard mati atau
+  restart, email tetap terkirim -- alasannya saja yang tertulis "tidak
+  diketahui".
+- Alasan hanya terbaca untuk bot yang dijalankan DARI dashboard itu. Bot
+  yang dijalankan dari terminal tidak punya log di dashboard.
 - Bot saat ini tidak punya stop loss, jadi tidak ada notifikasi "stop loss".
 
 Cara pakai:
@@ -45,6 +51,7 @@ import os
 import smtplib
 import ssl
 import time
+import urllib.request
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -229,6 +236,89 @@ def reconstruct_open_trip(fills: list[dict], current_qty: float) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Alasan penutupan dari log bot di dashboard
+# ---------------------------------------------------------------------------
+
+# Alasan penutupan, URUT PRIORITAS. Satu alasan bisa dikenali dari
+# beberapa bentuk baris log. Penanda dicocokkan persis (huruf besar-kecil).
+#   - DARURAT    : SL gagal terpasang, bot menutup posisi sendiri
+#   - STOP LOSS  : SL di bursa kena (fitur --risk-reward)
+#   - TAKE PROFIT: TP di bursa kena (--risk-reward) ATAU take profit lama
+#                  yang ditutup paksa oleh bot (--take-profit-pct)
+#   - REVERSAL   : bot mengirim order penutup karena sinyal berbalik.
+#                  Jalur lain di atas juga bisa mencetak baris ini, jadi
+#                  prioritasnya paling rendah.
+REASON_MARKERS: list[tuple[str, list[tuple[str, ...]]]] = [
+    ("PENUTUPAN DARURAT (SL gagal terpasang)", [("[stop-loss]", "DARURAT")]),
+    ("STOP LOSS", [("[stop-loss]", "TERTUTUP")]),
+    ("TAKE PROFIT", [("[take-profit]", "TUTUP PAKSA"), ("[take-profit]", "TERTUTUP")]),
+    ("REVERSAL SINYAL", [("[signal] posisi", "reduceOnly")]),
+]
+REASON_TTL_MS = 10 * 60 * 1000
+
+
+def _count(lines: list[str], markers: tuple[str, ...]) -> int:
+    return sum(1 for ln in lines if all(m in ln for m in markers))
+
+
+def _count_reason(lines: list[str], bentuk: list[tuple[str, ...]]) -> int:
+    return sum(_count(lines, m) for m in bentuk)
+
+
+class DashboardLog:
+    """
+    Membaca log bot dari /api dashboard (bot.log, 200 baris terakhir).
+    Log tidak bertimestamp, jadi yang dipantau adalah PERTAMBAHAN jumlah
+    baris penanda tiap alasan (lihat REASON_MARKERS) sejak putaran
+    sebelumnya. Saat penutupan terdeteksi, alasan dengan prioritas
+    tertinggi yang masih segar yang dipakai, lalu semua tanda dihabiskan.
+    Tanda kedaluwarsa setelah 10 menit supaya tidak menempel ke penutupan
+    yang tidak berhubungan. Kalau jumlahnya MENGECIL (bot di-restart,
+    log dikosongkan, atau baris lama tergeser), itu bukan kejadian --
+    cukup jadikan patokan baru.
+    """
+
+    def __init__(self, url: str, fetch=None):
+        self.url = url
+        self._fetch = fetch or self._http_get
+        self._base: dict[str, int] | None = None  # jumlah baris per alasan, putaran sebelumnya
+        self._flags: dict[str, int] = {}  # alasan -> waktu (ms) terakhir terlihat bertambah
+        self.reachable = False
+
+    @staticmethod
+    def _http_get(url: str) -> dict:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return json.loads(r.read().decode())
+
+    def poll(self, now_ms: int) -> None:
+        try:
+            # from_ms=sekarang: dashboard tidak perlu menyaring riwayat
+            # 30 hari untuk permintaan ini -- yang dibutuhkan cuma log bot.
+            sep = "&" if "?" in self.url else "?"
+            data = self._fetch(f"{self.url}{sep}from_ms={now_ms}")
+            lines = list((data.get("bot") or {}).get("log") or [])
+            self.reachable = True
+        except Exception:
+            self.reachable = False
+            return
+        n = {nama: _count_reason(lines, bentuk) for nama, bentuk in REASON_MARKERS}
+        if self._base is not None:
+            for nama, jumlah in n.items():
+                if jumlah > self._base.get(nama, 0):
+                    self._flags[nama] = now_ms
+        self._base = n
+
+    def reason(self, now_ms: int) -> str | None:
+        """Alasan untuk penutupan yang baru terdeteksi, lalu semua tanda dipakai habis."""
+        segar = {k: t for k, t in self._flags.items() if now_ms - t <= REASON_TTL_MS}
+        self._flags = {}
+        for nama, _ in REASON_MARKERS:
+            if nama in segar:
+                return nama
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Pengirim email Gmail
 # ---------------------------------------------------------------------------
 
@@ -311,7 +401,9 @@ def format_event(ev: dict, label: str, symbol: str, leverage: float | None, tp_p
                 f"jalan di akun yang sama.\n")
         return subj, body
     hasil = "UNTUNG" if ev["net"] > 0 else "RUGI"
-    subj = f"[{label}] TUTUP {arah} -- {hasil} {ev['net']:+.4f} USDT {symbol}"
+    alasan = ev.get("reason")
+    subj = (f"[{label}] TUTUP {arah}{' (' + alasan + ')' if alasan else ''} -- "
+            f"{hasil} {ev['net']:+.4f} USDT {symbol}")
     body = (f"Posisi ditutup.\n\nSimbol       : {symbol}\nArah         : {arah}\n"
             f"Jumlah maks  : {ev['max_qty']}\n")
     if ev["entry_avg"]:
@@ -330,8 +422,12 @@ def format_event(ev: dict, label: str, symbol: str, leverage: float | None, tp_p
     if not ev.get("complete", True):
         body += ("\nCatatan: posisi ini sudah terbuka sebelum notifier aktif dan riwayatnya tidak "
                  "terjangkau, jadi fee pembuka mungkin belum ikut terhitung.\n")
-    body += ("\nBursa tidak mencatat ALASAN penutupan (take profit, reversal sinyal, atau manual). "
-             "Cek log bot untuk alasannya.\n")
+    if alasan:
+        body += f"\nAlasan      : {alasan} (dari log bot di dashboard)\n"
+    else:
+        body += ("\nAlasan      : tidak diketahui. Log bot di dashboard tidak menunjukkan take profit "
+                 "maupun order penutup dari bot (dashboard mati, bot tidak dijalankan dari dashboard, "
+                 "atau posisi ditutup di luar bot).\n")
     return subj, body
 
 
@@ -341,7 +437,8 @@ def format_event(ev: dict, label: str, symbol: str, leverage: float | None, tp_p
 
 class Notifier:
     def __init__(self, broker, symbol: str, state_path: Path, sender, *, label="DEMO",
-                 tp_pct: float | None = None, history_days: int = 7, fetch_trades=None, now_ms=None):
+                 tp_pct: float | None = None, history_days: int = 7, fetch_trades=None, now_ms=None,
+                 dashboard: DashboardLog | None = None):
         self.broker, self.symbol, self.sender = broker, symbol, sender
         self.state_path = Path(state_path)
         self.label, self.tp_pct, self.history_days = label, tp_pct, history_days
@@ -349,6 +446,7 @@ class Notifier:
         if fetch_trades is None:
             from scripts.dashboard_donchian import fetch_all_trades as fetch_trades
         self._fetch_trades = fetch_trades
+        self.dashboard = dashboard
         self.state = self._load()
         self._mismatch = 0
 
@@ -417,6 +515,8 @@ class Notifier:
         qty_now, lev = self._position()
         if lev:
             st["leverage"] = lev
+        if self.dashboard is not None:
+            self.dashboard.poll(now)
 
         events: list[dict] = []
         for f in merge_by_order(siap):
@@ -431,6 +531,8 @@ class Notifier:
         for ev in events:
             if ev["type"] == "SIZE" and ev.get("same_order"):
                 continue  # sisa pecahan order yang sama -- bukan keputusan baru
+            if ev["type"] == "CLOSE" and self.dashboard is not None:
+                ev["reason"] = self.dashboard.reason(now)
             self._notify(ev, st.get("leverage"))
 
         if masih_mengendap:
@@ -490,7 +592,10 @@ def main() -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         broker = Broker(exchange_id="binanceusdm", testnet=testnet)
 
-    n = Notifier(broker, symbol, state_path, sender, label=label, tp_pct=tp_pct)
+    dash_url = (env.get("NOTIF_DASHBOARD_URL") or "").strip()
+    dashboard = DashboardLog(dash_url) if dash_url else None
+    n = Notifier(broker, symbol, state_path, sender, label=label, tp_pct=tp_pct, dashboard=dashboard)
+    print(f"  Alasan penutupan: {'dari log dashboard ' + dash_url if dash_url else 'tidak dibaca'}", flush=True)
     print(f"=== Notifier Gmail [{label}] {symbol} -- cek tiap {poll:.0f} detik "
           f"({'testnet/demo' if testnet else 'AKUN ASLI'}) ===", flush=True)
     n.start()

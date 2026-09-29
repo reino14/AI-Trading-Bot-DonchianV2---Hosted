@@ -115,6 +115,12 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
     if args.take_profit_pct is not None:
         print(f"  (Take-profit: {args.take_profit_pct:.1%}, "
               f"{'BERHENTI TOTAL setelah kena' if args.stop_after_take_profit else 'tahan arah sama sampai sinyal berbalik'})")
+    if args.risk_reward is not None:
+        print(f"  (SL + TP rasio {args.risk_reward:g}:1 BERSIH setelah fee, dititipkan ke BURSA:")
+        print(f"   SL = maks({args.sl_atr_mult:g} x ATR{args.sl_atr_period}, {args.sl_min_fee_mult:g} x fee bolak-balik), "
+              f"TP = {args.risk_reward:g} x SL + {args.risk_reward + 1:g} x fee.")
+        print(f"   Setelah TP: {'BERHENTI TOTAL' if args.stop_after_take_profit else 'tahan arah sampai sinyal berbalik'}. "
+              f"Setelah SL: tahan arah sampai sinyal berbalik.)")
 
     return PaperRunner(
         strategy, broker, symbol=args.symbol, timeframe=args.timeframe,
@@ -123,6 +129,8 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
         take_profit_pct=args.take_profit_pct, stop_after_take_profit=args.stop_after_take_profit,
         backfill_bars=args.backfill_bars, live_take_profit_poll_seconds=args.live_take_profit_poll_seconds,
         debug_info_fn=make_channel_debug_fn(args.lookback),
+        risk_reward=args.risk_reward, sl_atr_mult=args.sl_atr_mult, sl_atr_period=args.sl_atr_period,
+        sl_min_fee_mult=args.sl_min_fee_mult, bracket_poll_seconds=args.bracket_poll_seconds,
     )
 
 
@@ -158,6 +166,19 @@ def main() -> None:
                     help="mis. 5.0 -- pantau take-profit lewat harga LIVE tiap sekian detik, "
                          "TERPISAH dari evaluasi candle (yang cuma sekali per candle tutup). "
                          "Tanpa ini, take-profit tetap jalan tapi cuma dievaluasi sekali per candle.")
+    p.add_argument("--risk-reward", type=float, default=None,
+                    help="mis. 2 -- pasang STOP LOSS dan TAKE PROFIT di BURSA dengan rasio UANG BERSIH "
+                         "(setelah fee) R:1. Tidak bisa digabung dengan --take-profit-pct.")
+    p.add_argument("--sl-atr-mult", type=float, default=2.0,
+                    help="jarak SL = kelipatan ATR (default 2, aturan 2N sistem Turtle)")
+    p.add_argument("--sl-atr-period", type=int, default=20,
+                    help="jumlah bar untuk ATR, di timeframe bot (default 20)")
+    p.add_argument("--sl-min-fee-mult", type=float, default=2.0,
+                    help="batas bawah jarak SL = kelipatan fee bolak-balik (default 2), supaya "
+                         "fee paling banyak sepertiga dari kerugian per SL")
+    p.add_argument("--bracket-poll-seconds", type=float, default=5.0,
+                    help="seberapa sering bot mengecek apakah SL/TP sudah kena, untuk membereskan "
+                         "sisa order (eksekusi SL/TP sendiri oleh BURSA, tidak bergantung angka ini)")
     p.add_argument("--replay-historical", type=int, default=None,
                     help="jumlah bar 1H BTC SUNGGUHAN terakhir untuk diputar ulang lewat "
                          "process_bar() di mode --mock -- validasi kuat sebelum --live. "
@@ -173,6 +194,16 @@ def main() -> None:
         )
     if args.live and args.mock:
         raise SystemExit("--live dan --mock tidak bisa dipakai bersamaan -- pilih salah satu.")
+    if args.risk_reward is not None:
+        if args.take_profit_pct is not None:
+            raise SystemExit("--risk-reward dan --take-profit-pct tidak bisa dipakai bersamaan: "
+                             "keduanya memasang TP di bursa. Pilih salah satu.")
+        if args.risk_reward <= 0 or args.sl_atr_mult <= 0 or args.sl_atr_period <= 0 or args.sl_min_fee_mult < 0:
+            raise SystemExit("--risk-reward, --sl-atr-mult, --sl-atr-period harus > 0, "
+                             "dan --sl-min-fee-mult tidak boleh negatif.")
+        if args.live_take_profit_poll_seconds is not None:
+            print("  (Catatan: --live-take-profit-poll-seconds tidak berpengaruh di mode --risk-reward; "
+                  "SL/TP dieksekusi bursa.)")
 
     if args.lookback < 100:
         print(f"\nPERINGATAN: lookback={args.lookback} jauh di bawah plateau tervalidasi (148-328).")
