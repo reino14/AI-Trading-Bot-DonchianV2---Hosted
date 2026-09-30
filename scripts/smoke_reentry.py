@@ -215,10 +215,110 @@ def test_dashboard():
         sys.argv = asli
 
 
+async def test_status_note():
+    print("\n== 6. Keadaan menunggu tidak lagi diam: status tampil di log & dashboard ==")
+    from scripts.notifier_email import DashboardLog
+
+    # Skenario screenshot: sinyal short sudah ada, posisi 0, arah short ditahan
+    # (mis. baru kena SL), harga di bawah tengah channel, lalu menembus batas bawah.
+    r, br = buat("midline")
+    for i in range(7):
+        await bar(r, i, 100.0)
+    await bar(r, 7, 95.0)                                    # breakout bawah -> SHORT
+    check("(prasyarat) short terbuka", r._current_position == Position.SHORT)
+    picu(br, "STOP_MARKET", r._bracket["sl_price"])
+    await bar(r, 8, 96.0)                                    # SL kena -> arah short ditahan
+    check("(prasyarat) arah SHORT ditahan, belum siap", r._blocked_direction == Position.SHORT and not r._reentry_armed)
+
+    log = await bar(r, 9, 94.0) + await bar(r, 10, 93.0)     # sinyal tetap short, harga jauh di bawah tengah
+    check("heartbeat menjelaskan kenapa TIDAK masuk (belum siap)",
+          "[status] DITAHAN SHORT: belum siap" in log and "naik ke" in log, log.strip()[-230:])
+    check("menyebut angka: tengah channel dan batas breakout",
+          "(tengah channel)" in log and "di bawah" in log)
+    check("posisi memang tetap flat", r._current_position == Position.FLAT)
+    ss = json.loads(Path("data/session_state.json").read_text())
+    check("session_state.json membawa catatan status untuk dashboard", ss.get("status_note", "").startswith("DITAHAN SHORT"))
+
+    log = await bar(r, 11, 100.0)                            # naik ke tengah -> siap
+    log += await bar(r, 12, 100.0)
+    check("setelah siap: status berubah 'sudah siap'", "DITAHAN SHORT (sudah siap)" in log, log.strip()[-200:])
+
+    # Tidak boleh memicu mekanisme lain yang membaca log yang sama
+    baris = [ln for ln in (await bar(r, 13, 100.0)).splitlines() if "[heartbeat]" in ln]
+    semua = "\n".join(baris)
+    check("TIDAK memuat pasangan penanda auto-stop dashboard",
+          not any("stop_after_take_profit" in b and "BERHENTI trading total" in b for b in baris))
+    isi = {"lines": []}
+    d = DashboardLog("http://x/api", fetch=lambda u: {"bot": {"log": isi["lines"]}})
+    d.poll(1000)
+    isi["lines"] = semua.splitlines() * 3
+    d.poll(2000)
+    check("TIDAK dianggap penutupan oleh pembaca alasan notifier", d.reason(3000) is None)
+
+    # Keadaan berhenti / darurat
+    r2, br2 = buat("midline")
+    r2.stop_after_take_profit = True
+    for i in range(7):
+        await bar(r2, i, 100.0)
+    await bar(r2, 7, 105.0)
+    picu(br2, "TAKE_PROFIT_MARKET", r2._bracket["tp_price"])
+    await bar(r2, 8, 107.0)
+    log = await bar(r2, 9, 108.0)
+    check("bot berhenti: heartbeat menulis DIHENTIKAN (dulu diam)", "[status] DIHENTIKAN" in log and r2._trading_halted)
+    heartbeat_halt = [ln for ln in log.splitlines() if "[heartbeat]" in ln]
+    check("... tanpa penanda auto-stop (agar tidak memicu ulang)",
+          not any("stop_after_take_profit" in b and "BERHENTI trading total" in b for b in heartbeat_halt))
+
+    r3, br3 = buat("midline")
+    r3._emergency_close_pending = True
+    r3._status_note = r3._compute_status_note(1)
+    check("penutupan darurat: catatan DARURAT", r3._status_note.startswith("DARURAT"))
+
+    # Mode lama & posisi terbuka: tidak ada catatan palsu
+    r4, br4 = buat("reversal")
+    r4._blocked_direction = Position.SHORT
+    check("mode 'tunggu berbalik': tidak menambah catatan (log lamanya sudah menjelaskan)",
+          r4._compute_status_note(Position.SHORT) == "")
+    r5, br5 = buat("midline")
+    for i in range(7):
+        await bar(r5, i, 100.0)
+    log = await bar(r5, 7, 105.0)
+    check("posisi terbuka & normal: tanpa catatan", "[status]" not in log and r5._current_position == Position.LONG)
+
+
+def test_status_dashboard():
+    print("\n== 7. Dashboard menampilkan status ==")
+    if not NODE:
+        check("node tersedia untuk uji JavaScript", False)
+        return
+
+    def render(d, b):
+        code = js_function("panelStatusBot") + "\nconsole.log(JSON.stringify(panelStatusBot(" + json.dumps(d) + "," + json.dumps(b) + ")));"
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(code)
+        out = subprocess.run([NODE, f.name], capture_output=True, text=True, timeout=20)
+        if out.returncode:
+            raise RuntimeError(out.stderr)
+        return json.loads(out.stdout)
+
+    note = "DITAHAN SHORT: belum siap. Tunggu close naik ke 83479.75 (tengah channel) atau lebih tinggi"
+    h = render({"session_state": {"status_note": note}}, {"running": True})
+    check("bot jalan + ada catatan -> panel 'Status bot' tampil", "Status bot:" in h and "83479.75" in h and 'class="warn"' in h)
+    check("bot MATI -> catatan lama disembunyikan (file tidak dibersihkan saat bot mati)",
+          render({"session_state": {"status_note": note}}, {"running": False}) == "")
+    check("tanpa catatan -> tidak ada panel", render({"session_state": {"status_note": ""}}, {"running": True}) == "")
+    check("DIHENTIKAN / DARURAT -> ditampilkan sebagai galat (merah)",
+          'class="err"' in render({"session_state": {"status_note": "DIHENTIKAN: x"}}, {"running": True}))
+    check("teks disanitasi (tidak menyisipkan HTML)",
+          "<script>" not in render({"session_state": {"status_note": "a <script>x</script>"}}, {"running": True}))
+    check("panel dipasang di kartu Status", "panelStatusBot(d, b)" in dash.HTML_PAGE.split("<script>")[1])
+
+
 async def main_async():
     await test_setelah_tp()
     await test_setelah_sl()
     await test_berbalik_tetap_jalan()
+    await test_status_note()
 
 
 def main() -> int:
@@ -229,6 +329,7 @@ def main() -> int:
             asyncio.run(main_async())
             test_validasi_dan_launcher()
             test_dashboard()
+            test_status_dashboard()
         finally:
             os.chdir(asal)
     print("\n" + "=" * 62)

@@ -228,6 +228,10 @@ class PaperRunner:
         self.reentry_mode = reentry_mode
         self.reentry_channel_fn = reentry_channel_fn
         self._reentry_armed = False
+        # Catatan keadaan menunggu/berhenti -- dicetak di tiap heartbeat dan
+        # ditulis ke session_state.json untuk dashboard. Tanpa ini bot yang
+        # sengaja menunggu tampak MATI: log-nya cuma heartbeat.
+        self._status_note: str = ""
         # debug_info_fn: opsional -- fungsi (bars: list[dict]) -> str,
         # dipanggil tiap heartbeat DAN sekali setelah backfill, hasilnya
         # ditempel di output. PaperRunner TIDAK tahu apa isinya (tetap
@@ -431,8 +435,10 @@ class PaperRunner:
             except Exception as e:
                 debug_suffix = f"  (debug_info_fn error: {e})"
 
+        self._status_note = self._compute_status_note(latest_signal)
+        status_suffix = f"  [status] {self._status_note}" if self._status_note else ""
         print(f"  [heartbeat] {bar_time:%Y-%m-%d %H:%M} UTC  close={bar['close']:.2f}  "
-              f"posisi={self._current_position}  sinyal={latest_signal}{debug_suffix}")
+              f"posisi={self._current_position}  sinyal={latest_signal}{debug_suffix}{status_suffix}")
 
         if self._trading_halted:
             # stop_after_take_profit aktif dan sudah pernah kena -- tidak
@@ -520,6 +526,7 @@ class PaperRunner:
             "latest_signal": signal,
             "latest_price": price,
             "latest_bar_time": bar_time.isoformat(),
+            "status_note": self._status_note,
         }
         try:
             Path("data").mkdir(exist_ok=True)
@@ -938,6 +945,43 @@ class PaperRunner:
             print(f"  [stop-loss] arah {direction} DITAHAN sampai sinyal benar-benar berbalik "
                   f"(tidak langsung masuk lagi ke arah yang baru rugi).")
         return True
+
+    def _compute_status_note(self, latest_signal: int) -> str:
+        """
+        Kalimat singkat: kenapa bot TIDAK membuka posisi padahal sinyal ada.
+        Kosong = tidak ada yang perlu dijelaskan.
+
+        HATI-HATI dengan teksnya: dashboard mematikan bot kalau ada SATU baris
+        log yang memuat dua penanda take-profit-selesai sekaligus, dan
+        notifier membaca "[take-profit]"/"[stop-loss]" untuk alasan
+        penutupan. Teks di sini sengaja menghindari semua penanda itu
+        (diuji di smoke_reentry).
+        """
+        if self._emergency_close_pending:
+            return "DARURAT: SL gagal terpasang, bot sedang menutup posisi"
+        if self._trading_halted:
+            return "DIHENTIKAN: tidak membuka posisi baru (jalankan ulang bot untuk lanjut)"
+        if (self.reentry_mode == "midline" and self._blocked_direction is not None
+                and latest_signal == self._blocked_direction and self._current_position != latest_signal):
+            long = latest_signal == Position.LONG
+            arah = "LONG" if long else "SHORT"
+            try:
+                ch = self.reentry_channel_fn(self._bars)
+            except Exception:
+                ch = None
+            if not ch:
+                return f"DITAHAN {arah}: menunggu data channel"
+            atas, bawah = ch
+            tengah = (atas + bawah) / 2
+            batas = atas if long else bawah
+            if self._reentry_armed:
+                return (f"DITAHAN {arah} (sudah siap): masuk begitu close "
+                        f"{'di atas' if long else 'di bawah'} {batas:.2f}")
+            return (f"DITAHAN {arah}: belum siap. Tunggu close "
+                    f"{'turun ke' if long else 'naik ke'} {tengah:.2f} (tengah channel) "
+                    f"{'atau lebih rendah' if long else 'atau lebih tinggi'}, "
+                    f"baru masuk saat close {'di atas' if long else 'di bawah'} {batas:.2f}")
+        return ""
 
     async def _maybe_reenter(self, df: pd.DataFrame, direction: int) -> None:
         """

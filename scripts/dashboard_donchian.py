@@ -1199,6 +1199,20 @@ function panelSlTp(d, modeSlTp) {
   return h;
 }
 
+// Kenapa bot TIDAK membuka posisi padahal sinyal ada. Diambil dari
+// session_state.json yang ditulis bot tiap bar. Hanya tampil kalau bot
+// sedang jalan -- file itu tidak dibersihkan saat bot mati, jadi
+// catatan lamanya bisa menyesatkan.
+function panelStatusBot(d, b) {
+  const ss = d.session_state;
+  const catatan = (b && b.running && ss && ss.status_note) ? ss.status_note : "";
+  if (!catatan) return "";
+  const aman = catatan.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const gawat = /^(DARURAT|DIHENTIKAN)/.test(catatan);
+  return `<div class="${gawat ? "err" : "warn"}" style="margin-top:14px">`
+    + `<b>Status bot:</b> ${aman}</div>`;
+}
+
 // Keterangan satu baris di samping pilihan mode, supaya jelas akibatnya
 // sebelum bot dijalankan.
 function ketModeTp() {
@@ -1270,7 +1284,7 @@ function render(d) {
       <div class="note">${d.porto&&d.porto.modal_awal
         ? (d.porto.net>=0?"+":"")+d.porto.net.toFixed(2)+" USDT dari modal "+d.porto.modal_awal.toFixed(2)
         : "belum ada data saldo"}</div></div>
-  </div></div>`;
+  </div>${panelStatusBot(d, b)}</div>`;
 
   // ---- Posisi berjalan: untung/rugi yang BELUM direalisasi ----
   // Angka utama disamakan dengan yang tampil di aplikasi Binance, supaya
