@@ -133,6 +133,13 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
     if args.take_profit_pct is not None:
         print(f"  (Take-profit: {args.take_profit_pct:.1%}, "
               f"{'BERHENTI TOTAL setelah kena' if args.stop_after_take_profit else 'tahan arah sama sampai sinyal berbalik'})")
+    if getattr(args, "tp_roi_pct", None) is not None:
+        tahan_roi = ("masuk lagi setelah harga kembali ke tengah channel lalu breakout baru searah"
+                     if reentry_mode == "midline" else "tahan arah sampai sinyal berbalik")
+        print(f"  (SL/TP dari ROI KOTOR terhadap margin, dititipkan ke BURSA: TP +{args.tp_roi_pct:g}%, "
+              f"SL -{args.sl_roi_pct:g}%. Harga dihitung dari leverage posisi yang sebenarnya.")
+        print(f"   Setelah TP: {'BERHENTI TOTAL' if args.stop_after_take_profit else tahan_roi}. "
+              f"Setelah SL: {tahan_roi}.)")
     if args.risk_reward is not None:
         print(f"  (SL + TP rasio {args.risk_reward:g}:1 BERSIH setelah fee, dititipkan ke BURSA:")
         print(f"   SL = maks({args.sl_atr_mult:g} x ATR{args.sl_atr_period}, {args.sl_min_fee_mult:g} x fee bolak-balik), "
@@ -152,6 +159,8 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
         risk_reward=args.risk_reward, sl_atr_mult=args.sl_atr_mult, sl_atr_period=args.sl_atr_period,
         sl_min_fee_mult=args.sl_min_fee_mult, bracket_poll_seconds=args.bracket_poll_seconds,
         reentry_mode=reentry_mode,
+        tp_roi=(args.tp_roi_pct / 100) if getattr(args, "tp_roi_pct", None) is not None else None,
+        sl_roi=(args.sl_roi_pct / 100) if getattr(args, "sl_roi_pct", None) is not None else None,
         reentry_channel_fn=make_channel_fn(args.lookback) if reentry_mode == "midline" else None,
     )
 
@@ -201,6 +210,12 @@ def main() -> None:
     p.add_argument("--bracket-poll-seconds", type=float, default=5.0,
                     help="seberapa sering bot mengecek apakah SL/TP sudah kena, untuk membereskan "
                          "sisa order (eksekusi SL/TP sendiri oleh BURSA, tidak bergantung angka ini)")
+    p.add_argument("--tp-roi-pct", type=float, default=None,
+                    help="TAKE PROFIT sebagai ROI KOTOR terhadap margin, dalam PERSEN (mis. 5 = +5%%, sama "
+                         "dengan ROI di aplikasi Binance). Wajib berpasangan dengan --sl-roi-pct.")
+    p.add_argument("--sl-roi-pct", type=float, default=None,
+                    help="STOP LOSS sebagai ROI KOTOR terhadap margin, dalam PERSEN (mis. 1.5 = -1,5%%). "
+                         "Fee bolak-balik DITAMBAHKAN ke kerugian ini saat SL kena.")
     p.add_argument("--reentry-mode", choices=["reversal", "midline"], default="reversal",
                     help="setelah posisi ditutup TP/SL, kapan boleh masuk lagi ke arah YANG SAMA: "
                          "'reversal' (default) = tunggu sinyal berbalik; 'midline' = siap begitu harga "
@@ -220,6 +235,14 @@ def main() -> None:
         )
     if args.live and args.mock:
         raise SystemExit("--live dan --mock tidak bisa dipakai bersamaan -- pilih salah satu.")
+    if (args.tp_roi_pct is None) != (args.sl_roi_pct is None):
+        raise SystemExit("--tp-roi-pct dan --sl-roi-pct harus diisi berdua.")
+    if args.tp_roi_pct is not None:
+        if args.risk_reward is not None or args.take_profit_pct is not None:
+            raise SystemExit("--tp-roi-pct/--sl-roi-pct tidak bisa digabung dengan --risk-reward atau "
+                             "--take-profit-pct: semuanya memasang TP di bursa. Pilih satu cara.")
+        if args.tp_roi_pct <= 0 or args.sl_roi_pct <= 0:
+            raise SystemExit("--tp-roi-pct dan --sl-roi-pct harus > 0.")
     if args.risk_reward is not None:
         if args.take_profit_pct is not None:
             raise SystemExit("--risk-reward dan --take-profit-pct tidak bisa dipakai bersamaan: "

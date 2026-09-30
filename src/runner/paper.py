@@ -114,6 +114,32 @@ def compute_bracket(entry: float, direction: int, atr: float | None, fee_side: f
     }
 
 
+def compute_bracket_roi(entry: float, direction: int, leverage: float | None, tp_roi: float,
+                        sl_roi: float, fee_side: float) -> dict:
+    """
+    SL & TP dari ROI KOTOR terhadap MARGIN (definisi yang sama dengan
+    ROI di aplikasi Binance). FUNGSI MURNI.
+
+      gerak harga = ROI / leverage      (mis. ROI 5% di 20x -> harga 0,25%)
+      untung bersih TP = t - f,  rugi total SL = s + f   (f = fee bolak-balik)
+
+    Fee dibayar di KEDUA hasil, jadi rasio bersih (rr) biasanya jauh lebih
+    kecil dari tp_roi / sl_roi. rr dikembalikan supaya bisa ditampilkan.
+    """
+    lev = leverage if leverage and leverage > 0 else 1.0
+    fee_rt = 2 * fee_side
+    s, t = sl_roi / lev, tp_roi / lev
+    rugi, untung = s + fee_rt, t - fee_rt
+    return {
+        "entry": entry, "direction": direction, "atr": None, "fee_rt": fee_rt, "leverage": lev,
+        "tp_roi": tp_roi, "sl_roi": sl_roi, "sl_dist": s, "tp_dist": t,
+        "rr": (untung / rugi) if rugi > 0 else None,
+        "sl_basis": f"ROI kotor {sl_roi:.2%} / {lev:g}x",
+        "sl_price": entry * (1 - direction * s),
+        "tp_price": entry * (1 + direction * t),
+    }
+
+
 def classify_bracket_exit(exit_price: float | None, bracket: dict) -> str:
     """'TP', 'SL', atau 'UNKNOWN' -- pemicu mana yang paling dekat dengan harga keluar."""
     if exit_price is None:
@@ -149,6 +175,8 @@ class PaperRunner:
         sl_min_fee_mult: float = 2.0,
         bracket_poll_seconds: float = 5.0,
         reentry_mode: str = "reversal",
+        tp_roi: float | None = None,
+        sl_roi: float | None = None,
         reentry_channel_fn: Callable[[list[dict]], tuple[float, float] | None] | None = None,
     ):
         self.strategy = strategy
@@ -172,6 +200,18 @@ class PaperRunner:
         self.sl_atr_period = sl_atr_period
         self.sl_min_fee_mult = sl_min_fee_mult
         self.bracket_poll_seconds = bracket_poll_seconds
+        # SL/TP berdasarkan ROI KOTOR terhadap margin (fraksi: 0.05 = 5%).
+        # Alternatif dari risk_reward; keduanya tidak boleh aktif bersamaan.
+        if (tp_roi is None) != (sl_roi is None):
+            raise ValueError("tp_roi dan sl_roi harus diisi berdua")
+        if tp_roi is not None:
+            if risk_reward is not None:
+                raise ValueError("pilih salah satu: risk_reward ATAU tp_roi/sl_roi")
+            if tp_roi <= 0 or sl_roi <= 0:
+                raise ValueError("tp_roi dan sl_roi harus > 0")
+        self.tp_roi = tp_roi
+        self.sl_roi = sl_roi
+        self._bracket_enabled = risk_reward is not None or tp_roi is not None
         # reentry_mode: kapan boleh masuk lagi ke arah YANG SAMA setelah
         # posisi ditutup TP/SL (mode berulang):
         #   "reversal" (default, perilaku lama): tunggu sinyal berbalik.
@@ -332,7 +372,7 @@ class PaperRunner:
 
         self.order_manager.reconcile_pending(self.symbol)  # WAJIB, lihat docstring modul
         self._recover_position_from_exchange()  # WAJIB juga -- lihat docstring: cegah order tutup tak perlu saat restart
-        if self.risk_reward is not None:
+        if self._bracket_enabled:
             await self._ensure_bracket_after_recovery()
 
         async def _bar_loop() -> None:
@@ -344,8 +384,10 @@ class PaperRunner:
             print(f"  [price-watch] take-profit real-time AKTIF -- cek harga live tiap "
                   f"{self.live_take_profit_poll_seconds:.0f} detik, TERPISAH dari evaluasi candle.")
             loops.append(self._price_watch_loop(self.live_take_profit_poll_seconds))
-        if self.risk_reward is not None:
-            print(f"  [bracket] SL + TP rasio {self.risk_reward:g}:1 (bersih setelah fee) AKTIF -- "
+        if self._bracket_enabled:
+            aturan = (f"TP ROI kotor +{self.tp_roi:.2%} / SL ROI kotor -{self.sl_roi:.2%}"
+                      if self.tp_roi is not None else f"SL + TP rasio {self.risk_reward:g}:1 (bersih setelah fee)")
+            print(f"  [bracket] {aturan} AKTIF -- "
                   f"dieksekusi BURSA; bot mengecek posisi tiap {self.bracket_poll_seconds:g} detik "
                   f"untuk membereskan sisa order setelah salah satunya kena.")
             loops.append(self._bracket_watch_loop(self.bracket_poll_seconds))
@@ -690,10 +732,30 @@ class PaperRunner:
         tidak lolos verifikasi, posisi DITUTUP -- tidak pernah dibiarkan
         terbuka tanpa SL.
         """
-        atr = compute_atr(self._bars, self.sl_atr_period)
-        b = compute_bracket(self._entry_price, direction, atr, self._entry_taker_fee_pct,
-                            self.risk_reward, self.sl_atr_mult, self.sl_min_fee_mult)
+        if self.tp_roi is not None:
+            b = compute_bracket_roi(self._entry_price, direction, self._entry_leverage,
+                                    self.tp_roi, self.sl_roi, self._entry_taker_fee_pct)
+        else:
+            atr = compute_atr(self._bars, self.sl_atr_period)
+            b = compute_bracket(self._entry_price, direction, atr, self._entry_taker_fee_pct,
+                                self.risk_reward, self.sl_atr_mult, self.sl_min_fee_mult)
         pos_side = "long" if direction == Position.LONG else "short"
+
+        # Harga SUDAH melewati target? (terjadi saat posisi lama dipasangi
+        # SL/TP baru setelah restart, atau SL yang sangat dekat.) Bursa akan
+        # menolak order bersyarat yang langsung terpicu, jadi tutup sekarang.
+        try:
+            kini = self.broker.fetch_current_price(self.symbol)
+        except Exception:
+            kini = None
+        if kini is not None:
+            long = direction == Position.LONG
+            lewat_tp = (kini >= b["tp_price"]) if long else (kini <= b["tp_price"])
+            lewat_sl = (kini <= b["sl_price"]) if long else (kini >= b["sl_price"])
+            if lewat_tp or lewat_sl:
+                await self._close_target_already_reached("TP" if lewat_tp else "SL", kini, b, direction)
+                return
+
         self._cancel_conditional_orders_safely("bersihkan sisa sebelum pasang SL/TP baru")
 
         try:
@@ -720,14 +782,53 @@ class PaperRunner:
         notional = self.order_amount * self._entry_price
         rugi = notional * (b["sl_dist"] + b["fee_rt"])
         untung = notional * (b["tp_dist"] - b["fee_rt"])
-        atr_txt = f"{b['atr']:.2f}" if b["atr"] is not None else "belum tersedia"
-        print(f"  [bracket] SL/TP dititipkan ke BURSA -- {pos_side.upper()} entry {self._entry_price:.2f}, "
-              f"ATR{self.sl_atr_period} {atr_txt}, fee {self._entry_taker_fee_pct:.3%}/sisi:")
-        print(f"     SL {b['sl_price']:.2f} (jarak {b['sl_dist']:.3%}, dasar: {b['sl_basis']}) "
-              f"-> rugi bersih ~{rugi:.2f} USDT")
-        print(f"     TP {b['tp_price']:.2f} (jarak {b['tp_dist']:.3%}) -> untung bersih ~{untung:.2f} USDT "
-              f"(rasio bersih {self.risk_reward:g}:1)")
+        rasio = f"{b['rr']:.3g}" if b.get("rr") is not None else "?"
+        if b.get("tp_roi") is not None:
+            print(f"  [bracket] SL/TP dititipkan ke BURSA -- {pos_side.upper()} entry {self._entry_price:.2f}, "
+                  f"leverage {b['leverage']:g}x, fee {self._entry_taker_fee_pct:.3%}/sisi:")
+            print(f"     SL {b['sl_price']:.2f} (harga {b['sl_dist']:.3%} = ROI kotor -{b['sl_roi']:.2%}) "
+                  f"-> rugi total ~{rugi:.2f} USDT termasuk fee")
+            print(f"     TP {b['tp_price']:.2f} (harga {b['tp_dist']:.3%} = ROI kotor +{b['tp_roi']:.2%}) "
+                  f"-> untung bersih ~{untung:.2f} USDT (rasio bersih {rasio}:1)")
+            if untung <= 0:
+                print("     PERINGATAN: TP ini TIDAK menutup fee -- kalau TP kena, hasilnya tetap RUGI.")
+        else:
+            atr_txt = f"{b['atr']:.2f}" if b["atr"] is not None else "belum tersedia"
+            print(f"  [bracket] SL/TP dititipkan ke BURSA -- {pos_side.upper()} entry {self._entry_price:.2f}, "
+                  f"ATR{self.sl_atr_period} {atr_txt}, fee {self._entry_taker_fee_pct:.3%}/sisi:")
+            print(f"     SL {b['sl_price']:.2f} (jarak {b['sl_dist']:.3%}, dasar: {b['sl_basis']}) "
+                  f"-> rugi bersih ~{rugi:.2f} USDT")
+            print(f"     TP {b['tp_price']:.2f} (jarak {b['tp_dist']:.3%}) -> untung bersih ~{untung:.2f} USDT "
+                  f"(rasio bersih {rasio}:1)")
         print(f"     {detail}")
+
+    async def _close_target_already_reached(self, kind: str, kini: float, b: dict, direction: int) -> None:
+        """Harga sudah di/lewat TP atau SL saat akan dipasang -> tutup sekarang, terapkan aturan TP/SL."""
+        if kind == "TP":
+            print(f"  [take-profit] harga {kini:.2f} SUDAH mencapai target TP {b['tp_price']:.2f} -- TUTUP PAKSA sekarang.")
+        else:
+            print(f"  [stop-loss] harga {kini:.2f} SUDAH melewati SL {b['sl_price']:.2f} -- posisi ditutup sekarang.")
+        self._bracket = None
+        self._cancel_conditional_orders_safely("harga sudah melewati target")
+        await self._handle_signal_change(Position.FLAT, override_price=kini)
+        if self._current_position != Position.FLAT:
+            # Jangan biarkan posisi terbuka tanpa SL: jalur darurat mencoba
+            # menutup tiap bar, lalu menghentikan bot setelah flat.
+            print("  [stop-loss] order penutup belum terisi -- dialihkan ke penutupan DARURAT.")
+            self._emergency_close_pending = True
+            return
+        if kind == "TP":
+            if self.stop_after_take_profit:
+                self._trading_halted = True
+                print("  [take-profit] Penutupan terkonfirmasi FLAT -- stop_after_take_profit "
+                      "AKTIF, program BERHENTI trading total (restart manual untuk lanjut).")
+            else:
+                self._blocked_direction = direction
+                self._reentry_armed = False
+        else:
+            print("  [stop-loss] posisi TERTUTUP di sekitar harga SL.")
+            self._blocked_direction = direction
+            self._reentry_armed = False
 
     def _verify_stop_loss(self, expected: float, sl_id: str) -> tuple[bool, str]:
         """
@@ -915,6 +1016,21 @@ class PaperRunner:
             orders = []
         sls = [o for o in orders if o["type"].startswith("STOP") and o["trigger_price"]]
         tps = [o for o in orders if o["type"].startswith("TAKE_PROFIT")]
+        if self.tp_roi is not None and self._entry_price:
+            # Mode ROI hasilnya PASTI dari harga masuk + leverage, jadi SL/TP
+            # yang tidak cocok dengan pengaturan sekarang (mis. sisa mode
+            # rasio/ATR) diganti. Mode ATR tidak begini: SL-nya sengaja tetap.
+            b = compute_bracket_roi(self._entry_price, self._current_position, self._entry_leverage,
+                                    self.tp_roi, self.sl_roi, self._entry_taker_fee_pct)
+            cocok = lambda o, harga: o["trigger_price"] and abs(o["trigger_price"] - harga) / harga <= 0.0005
+            if not (sls and tps and cocok(sls[0], b["sl_price"]) and cocok(tps[0], b["tp_price"])):
+                lama = (f"SL {sls[0]['trigger_price']:.2f}" if sls else "tanpa SL") + \
+                       (f" / TP {tps[0]['trigger_price']:.2f}" if tps and tps[0]["trigger_price"] else " / tanpa TP")
+                print(f"  [startup] SL/TP di bursa ({lama}) TIDAK sesuai pengaturan sekarang (TP ROI "
+                      f"+{self.tp_roi:.2%}, SL ROI -{self.sl_roi:.2%}) -- DIGANTI dari harga masuk "
+                      f"{self._entry_price:.2f}.")
+                await self._place_bracket(self._current_position, self._entry_price)
+                return
         if sls:
             self._sl_order_id = sls[0]["id"]
             self._tp_order_id = tps[0]["id"] if tps else None
@@ -1152,7 +1268,7 @@ class PaperRunner:
         # bursa setelah posisi ditutup lewat reversal sinyal. Hanya dipanggil
         # kalau memang ada yang mungkin tertinggal, jadi mode lama tanpa
         # TP bursa tidak terpengaruh.
-        if self._bracket is not None or self._tp_order_id is not None or self.risk_reward is not None:
+        if self._bracket is not None or self._tp_order_id is not None or self._bracket_enabled:
             self._cancel_conditional_orders_safely("sebelum kirim order baru")
 
         order_price = self._aggressive_price(side, signal_price)
@@ -1260,7 +1376,7 @@ class PaperRunner:
                 # yang membuat net_roi PERSIS sama dengan take_profit_pct.
                 #   net = raw*L - 2*f*L >= TP   ->   raw >= TP/L + 2*f
                 # Perhatikan suku fee TIDAK ikut terbagi leverage.
-                if self.risk_reward is not None:
+                if self._bracket_enabled:
                     await self._place_bracket(target_after_this_order, signal_price)
                 elif self.take_profit_pct is not None:
                     direction = 1 if target_after_this_order == Position.LONG else -1

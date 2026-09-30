@@ -96,11 +96,10 @@ def test_command():
 def test_html():
     print("\n== 2. Form dan skrip halaman ==")
     h = dash.HTML_PAGE
-    check("field Untung : Rugi & Jarak SL ada", 'id="c_rr"' in h and 'id="c_slatr"' in h)
+    check("field TP & SL (ROI %) ada", 'id="c_tp_roi"' in h and 'id="c_sl_roi"' in h)
     check("field Take profit & Poll TP lama sudah dihapus", 'id="c_tp"' not in h and 'id="c_poll"' not in h)
-    check("konfig() mengirim risk_reward, tidak take_profit_pct",
-          "risk_reward:" in js_function("konfig") and "take_profit_pct" not in js_function("konfig"))
-    check("batas fee JS diisi dari konstanta Python", f"const SL_MIN_FEE_MULT_JS = {float(dash.SL_MIN_FEE_MULT)!r};" in h)
+    check("konfig() mengirim tp_roi_pct/sl_roi_pct, tidak take_profit_pct",
+          "tp_roi_pct:" in js_function("konfig") and "take_profit_pct" not in js_function("konfig"))
     if not NODE:
         check("node tersedia untuk uji JavaScript", False, "pasang nodejs untuk menjalankan uji 2-4")
         return
@@ -111,25 +110,8 @@ def test_html():
 
 
 def test_preview_matches_bot():
-    print("\n== 3. Pratinjau di layar = angka yang dipakai bot ==")
-    if not NODE:
-        return
-    kasus = [(85000.0, 0.01, 40.0, 0.0005, 2.0, 2.0),    # 1m: ATR kecil -> batas bawah fee
-             (85000.0, 0.01, 400.0, 0.0005, 2.0, 2.0),   # ATR besar -> ATR yang menentukan
-             (60000.0, 0.02, None, 0.0004, 3.0, 1.5),    # ATR belum ada
-             (85000.0, 0.01, 212.5, 0.0005, 2.0, 2.0)]   # tepat di perbatasan
-    js = js_function("pratinjauRR") + "\nconsole.log(JSON.stringify([" + ",".join(
-        f"pratinjauRR({p},{q},{'null' if a is None else a},{fee},{rr},{k},{dash.SL_MIN_FEE_MULT})"
-        for p, q, a, fee, rr, k in kasus) + "]));"
-    hasil = run_node(js)
-    for (p, q, a, fee, rr, k), j in zip(kasus, hasil):
-        b = compute_bracket(p, 1, a, fee, rr, k, dash.SL_MIN_FEE_MULT)
-        rugi, untung = p * q * (b["sl_dist"] + b["fee_rt"]), p * q * (b["tp_dist"] - b["fee_rt"])
-        sama = all(abs(x - y) < 1e-9 for x, y in
-                   [(j["s"], b["sl_dist"]), (j["t"], b["tp_dist"]), (j["rugi"], rugi), (j["untung"], untung)])
-        check(f"harga {p:.0f}, ATR {a}, R {rr}: SL {j['s']:.3%} TP {j['t']:.3%} "
-              f"rugi {j['rugi']:.2f} untung {j['untung']:.2f}", sama)
-        check(f"   ... rasio untung/rugi bersih = {rr}:1", abs(j["untung"] / j["rugi"] - rr) < 1e-9)
+    print("\n== 3. Pratinjau di layar = angka bot ==")
+    print("   (pindah ke scripts/smoke_roi_bracket.py bagian 7 -- form kini berbasis ROI)")
 
 
 def test_panel():
@@ -150,17 +132,16 @@ def test_panel():
     out = run_node(js)
     check("mode SL/TP + SL tidak ada -> PERINGATAN merah", "TIDAK dilindungi stop loss" in out["sl_hilang"])
     check("SL & TP ada -> harga pemicu tampil", "84830.00" in out["lengkap"] and "85595.00" in out["lengkap"])
-    check("... dengan jarak dari harga masuk", "0.20% dari harga masuk" in out["lengkap"], out["lengkap"][:300])
+    check("... dengan gerak harga dari harga masuk", "harga \u22120.200%" in out["lengkap"], out["lengkap"][:300])
     check("tidak ada peringatan palsu kalau SL ada", "TIDAK dilindungi" not in out["lengkap"])
     check("gagal dibaca -> dibilang tidak terbaca, bukan 'tidak ada'", "tidak bisa dibaca" in out["tak_terbaca"])
     check("mode lama tanpa SL/TP -> tidak ada peringatan", "TIDAK dilindungi" not in out["mode_lama"])
 
-    ekspr = r'(b.cmd.match(/--risk-reward (\S+)/) || [,"?"])[1].replace(/\.0$/, "")'
-    ada = re.search(re.escape("--risk-reward (\\S+)"), dash.HTML_PAGE)
-    check("label status membaca rasio dari perintah bot", ada is not None)
-    r = run_node("const b={cmd:'python -m x --live --risk-reward 2.0 --sl-atr-mult 2.0'};"
-                 f"console.log(JSON.stringify({ekspr}));")
-    check("... hasilnya '2' (tampil sebagai SL/TP 2:1)", r == "2", repr(r))
+    baris = [ln.strip() for ln in script_block().splitlines() if ln.strip().startswith("const angkaFlag =")]
+    check("label status membaca angka dari perintah bot", len(baris) == 1)
+    r = run_node("const b={cmd:'python -m x --live --tp-roi-pct 5.0 --sl-roi-pct 1.5'};\n" + baris[0] +
+                 "\nconsole.log(JSON.stringify([angkaFlag('tp-roi-pct'), angkaFlag('sl-roi-pct')]));")
+    check("... hasilnya TP '5' dan SL '1.5'", r == ["5", "1.5"], repr(r))
 
 
 class FakeBroker:

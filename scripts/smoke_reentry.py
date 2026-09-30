@@ -163,7 +163,7 @@ def js_function(name: str) -> str:
 
 def konfig_js(nilai: dict) -> dict:
     stub = "const nilai = " + json.dumps(nilai) + ";\nconst pilih = id => ({value: nilai[id] ?? ''});\n"
-    code = stub + js_function("rasioUntungRugi") + "\n" + js_function("konfig") + "\nconsole.log(JSON.stringify(konfig()));"
+    code = stub + js_function("roiKeduanya") + "\n" + js_function("konfig") + "\nconsole.log(JSON.stringify(konfig()));"
     with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
         f.write(code)
     out = subprocess.run([NODE, f.name], capture_output=True, text=True, timeout=20)
@@ -173,33 +173,33 @@ def konfig_js(nilai: dict) -> dict:
 
 
 def test_dashboard():
-    print("\n== 5. Dashboard: rasio dua sisi & pilihan mode ==")
+    print("\n== 5. Dashboard: TP/SL ROI & pilihan mode ==")
     h = dash.HTML_PAGE
-    check("field Rasio untung & Rasio rugi ada", 'id="c_untung"' in h and 'id="c_rugi"' in h)
+    check("field TP & SL (ROI %) ada", 'id="c_tp_roi"' in h and 'id="c_sl_roi"' in h)
     check("pilihan 'Berulang -- masuk lagi dari tengah channel' ada", 'value="tengah"' in h)
     check("pilihan lama 'tunggu sinyal berbalik' tetap ada", 'value="berulang"' in h)
     if not NODE:
         check("node tersedia untuk uji JavaScript", False, "pasang nodejs untuk uji form")
         return
     dasar = {"c_symbol": SYM, "c_timeframe": "1h", "c_lookback": "238", "c_amount": "0.01", "c_session": "",
-             "c_slatr": "2", "c_backfill": "300"}
-    k = konfig_js({**dasar, "c_untung": "3", "c_rugi": "2", "c_mode_tp": "tengah"})
-    check("untung 3 : rugi 2 -> rasio 1.5 dikirim ke bot", k["risk_reward"] == 1.5, str(k["risk_reward"]))
+             "c_backfill": "300"}
+    k = konfig_js({**dasar, "c_tp_roi": "5", "c_sl_roi": "1.5", "c_mode_tp": "tengah"})
+    check("TP 5% & SL 1,5% dikirim ke bot", (k["tp_roi_pct"], k["sl_roi_pct"]) == (5, 1.5), str(k))
     check("mode 'dari tengah' -> reentry_mode midline, tidak berhenti setelah TP",
           k["reentry_mode"] == "midline" and k["stop_after_take_profit"] is False)
-    k2 = konfig_js({**dasar, "c_untung": "", "c_rugi": "1", "c_mode_tp": "berulang"})
-    check("untung dikosongkan -> tanpa SL/TP", k2["risk_reward"] is None)
+    k2 = konfig_js({**dasar, "c_tp_roi": "", "c_sl_roi": "1.5", "c_mode_tp": "berulang"})
+    check("TP dikosongkan -> tanpa SL/TP sama sekali", k2["tp_roi_pct"] is None and k2["sl_roi_pct"] is None)
     check("mode 'tunggu berbalik' -> tanpa flag midline", k2["reentry_mode"] is None)
-    k3 = konfig_js({**dasar, "c_untung": "2", "c_rugi": "0", "c_mode_tp": "sekali"})
-    check("rugi 0 -> ditolak jadi tanpa SL/TP (bukan pembagian nol)", k3["risk_reward"] is None)
+    k3 = konfig_js({**dasar, "c_tp_roi": "5", "c_sl_roi": "0", "c_mode_tp": "sekali"})
+    check("SL 0 -> tanpa SL/TP (posisi tidak dibuka dengan SL nol)", k3["tp_roi_pct"] is None and k3["sl_roi_pct"] is None)
     check("mode 'sekali saja' -> berhenti setelah TP", k3["stop_after_take_profit"] is True)
 
     print("   rantai utuh: form -> perintah dashboard -> launcher")
     k["symbol"], k["lookback"] = SYM, 238
     cmd = dash.build_bot_command(k)
     s = " ".join(cmd)
-    check("perintah memuat --risk-reward 1.5 dan --reentry-mode midline",
-          "--risk-reward 1.5" in s and "--reentry-mode midline" in s, s)
+    check("perintah memuat --tp-roi-pct 5.0 --sl-roi-pct 1.5 dan --reentry-mode midline",
+          "--tp-roi-pct 5.0 --sl-roi-pct 1.5" in s and "--reentry-mode midline" in s, s)
     argv = ["--mock" if a == "--live" else a for a in cmd[cmd.index("scripts.run_paper_donchian_futures") + 1:]]
     asli = sys.argv
     try:
@@ -207,10 +207,10 @@ def test_dashboard():
         buf = io.StringIO()
         with redirect_stdout(buf):
             L.main()
-        check("launcher menerima dan menampilkan rasio 1.5:1 + aturan masuk lagi",
-              "rasio 1.5:1" in buf.getvalue() and "tengah channel" in buf.getvalue())
+        check("launcher menerima dan menampilkan TP/SL ROI + aturan masuk lagi",
+              "TP +5%" in buf.getvalue() and "tengah channel" in buf.getvalue())
     except SystemExit as e:
-        check("launcher menerima dan menampilkan rasio 1.5:1 + aturan masuk lagi", False, str(e))
+        check("launcher menerima dan menampilkan TP/SL ROI + aturan masuk lagi", False, str(e))
     finally:
         sys.argv = asli
 

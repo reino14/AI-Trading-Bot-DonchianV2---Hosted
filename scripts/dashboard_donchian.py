@@ -400,6 +400,9 @@ def build_bot_command(cfg: dict) -> list[str]:
         cmd += ["--risk-reward", str(float(cfg["risk_reward"]))]
         if cfg.get("sl_atr_mult"):
             cmd += ["--sl-atr-mult", str(float(cfg["sl_atr_mult"]))]
+    # SL/TP dari ROI kotor terhadap margin (persen).
+    if cfg.get("tp_roi_pct") and cfg.get("sl_roi_pct"):
+        cmd += ["--tp-roi-pct", str(float(cfg["tp_roi_pct"])), "--sl-roi-pct", str(float(cfg["sl_roi_pct"]))]
     if cfg.get("reentry_mode") == "midline":
         cmd += ["--reentry-mode", "midline"]
     return cmd
@@ -527,6 +530,9 @@ class DashboardState:
         # Fee taker per simbol, diambil SEKALI dari akun lalu disimpan --
         # tidak perlu ditanyakan ke bursa tiap refresh.
         self._fee_cache: dict[str, float] = {}
+        # Leverage posisi terakhir yang pernah terlihat -- dipakai pratinjau
+        # SL/TP di form saat sedang tidak ada posisi.
+        self._last_leverage: float | None = None
 
     def set_params(self, symbol: str, lookback: int, timeframe: str) -> None:
         with self.lock:
@@ -619,6 +625,8 @@ class DashboardState:
             # SL/TP yang BENAR-BENAR ada di bursa untuk posisi ini -- supaya
             # tidak perlu membuka Binance untuk memastikan posisi terlindungi.
             # None = tidak bisa dibaca (dibedakan dari [] = memang tidak ada).
+            if position and position.get("leverage"):
+                self._last_leverage = float(position["leverage"])
             bracket_orders = None
             if position and hasattr(broker, "fetch_open_conditional_orders"):
                 try:
@@ -642,6 +650,7 @@ class DashboardState:
                     "pnl_berjalan": pnl_berjalan,
                     "atr": atr, "atr_period": ATR_PERIOD, "fee_taker": fee_taker,
                     "bracket_orders": bracket_orders,
+                    "leverage_terakhir": round(self._last_leverage) if self._last_leverage else None,
                     "history_days": self.history_days,
                     "n_trades_loaded": len(trades),
                     "oldest_trade": trades[0].get("datetime") if trades else None,
@@ -773,9 +782,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="f"><label>Amount (BTC)</label><input id="c_amount" type="number" step="0.001" value="0.001" oninput="hitungNotional()">
         <div class="sub" id="ket_amount" style="font-size:11px;margin-top:5px;line-height:1.5">&mdash;</div></div>
       <div class="f"><label>Session (jam)</label><input id="c_session" type="number" step="0.5" value="24"></div>
-      <div class="f"><label>Rasio untung</label><input id="c_untung" type="number" step="0.5" min="0" value="2" oninput="hitungNotional()"></div>
-      <div class="f"><label>Rasio rugi</label><input id="c_rugi" type="number" step="0.5" min="0" value="1" oninput="hitungNotional()"></div>
-      <div class="f"><label>Jarak SL (&times; ATR)</label><input id="c_slatr" type="number" step="0.5" min="0.5" value="2" oninput="hitungNotional()"></div>
+      <div class="f"><label>Take profit (ROI kotor %)</label><input id="c_tp_roi" type="number" step="0.5" min="0" value="5" oninput="hitungNotional()"></div>
+      <div class="f"><label>Stop loss (ROI kotor %)</label><input id="c_sl_roi" type="number" step="0.5" min="0" value="1.5" oninput="hitungNotional()"></div>
       <div class="f"><label>Backfill (bar)</label><input id="c_backfill" type="number" value="200"></div>
     </div>
     <div class="sub" id="ket_rr" style="font-size:12px;margin-top:10px;line-height:1.55">&mdash;</div>
@@ -806,8 +814,8 @@ function konfig() {
     symbol: pilih("c_symbol").value, timeframe: pilih("c_timeframe").value,
     lookback: +pilih("c_lookback").value, amount: +pilih("c_amount").value,
     session_hours: +pilih("c_session").value || null,
-    risk_reward: rasioUntungRugi(),
-    sl_atr_mult: +pilih("c_slatr").value || null,
+    tp_roi_pct: roiKeduanya() ? +pilih("c_tp_roi").value : null,
+    sl_roi_pct: roiKeduanya() ? +pilih("c_sl_roi").value : null,
     stop_after_take_profit: pilih("c_mode_tp").value === "sekali",
     reentry_mode: pilih("c_mode_tp").value === "tengah" ? "midline" : null,
     backfill_bars: +pilih("c_backfill").value || null,
@@ -855,48 +863,73 @@ function set7Hari() {
 let hargaTerakhir = null;
 let leverageTerakhir = null;
 let atrTerakhir = null, feeTerakhir = null, periodeAtr = 20;
-const SL_MIN_FEE_MULT_JS = __SL_MIN_FEE_MULT__;
 
-// Pratinjau SL/TP -- RUMUS SAMA dengan compute_bracket() di paper.py
-// (diuji terhadapnya di smoke test). Semua jarak dalam fraksi harga.
-//   f = 2 x fee satu sisi;  s = maks(k x ATR / harga, batas x f);
-//   t = R x s + (R + 1) x f  -> untung bersih TP = R x rugi bersih SL.
-function pratinjauRR(harga, jumlah, atr, fee, rr, kAtr, batasFee) {
-  const f = 2 * fee;
-  const lantai = batasFee * f;
-  const dAtr = (atr && harga) ? kAtr * atr / harga : null;
-  const pakaiAtr = dAtr !== null && dAtr >= lantai;
-  const s = pakaiAtr ? dAtr : lantai;
-  const t = rr * s + (rr + 1) * f;
-  const nilai = jumlah * harga;
-  return {s, t, pakaiAtr, rugi: nilai * (s + f), untung: nilai * (t - f)};
+// Pratinjau SL/TP berbasis ROI KOTOR terhadap margin -- RUMUS SAMA dengan
+// compute_bracket_roi() di paper.py (diuji angka per angka di smoke test).
+//   gerak harga = ROI / leverage;  f = fee bolak-balik (fraksi harga)
+//   untung bersih TP = nilai x (t - f);  rugi total SL = nilai x (s + f)
+function pratinjauROI(harga, jumlah, lev, fee, tpPct, slPct) {
+  const f = 2 * fee, s = slPct / 100 / lev, t = tpPct / 100 / lev;
+  const nilai = jumlah * harga, biaya = nilai * f;
+  const untungBersih = nilai * (t - f), rugiTotal = nilai * (s + f);
+  const roiFee = f * lev * 100;
+  return {
+    s, t, margin: nilai / lev, biaya, roiFee,
+    untungKotor: nilai * t, rugiKotor: nilai * s, untungBersih, rugiTotal,
+    roiBersihTp: tpPct - roiFee, roiTotalSl: slPct + roiFee,
+    rasio: rugiTotal > 0 ? untungBersih / rugiTotal : null,
+    impas: untungBersih > 0 ? rugiTotal / (untungBersih + rugiTotal) : null,
+    slDiBawahFee: s < f,
+  };
 }
 
-// Rasio yang dikirim ke bot = untung / rugi (mis. 3 : 2 -> 1.5). Bot hanya
-// butuh satu angka; rumus SL/TP-nya tidak berubah. null = tanpa SL/TP.
-function rasioUntungRugi() {
-  const u = parseFloat(pilih("c_untung").value), r = parseFloat(pilih("c_rugi").value);
-  return (u > 0 && r > 0) ? u / r : null;
+function roiKeduanya() {
+  return +pilih("c_tp_roi").value > 0 && +pilih("c_sl_roi").value > 0;
 }
 
-function hitungRR() {
+// Leverage untuk pratinjau: posisi yang sedang terbuka, atau leverage
+// posisi terakhir yang pernah terlihat. Bot sendiri selalu memakai
+// leverage posisi SEBENARNYA saat masuk.
+let leverageAcuan = null;
+
+function hitungSlTp() {
   const el = pilih("ket_rr");
   if (!el) return;
-  const rr = rasioUntungRugi(), k = parseFloat(pilih("c_slatr").value);
-  const u = pilih("c_untung").value, r = pilih("c_rugi").value;
-  const amt = parseFloat(pilih("c_amount").value);
-  if (!rr || rr <= 0) {
-    el.innerHTML = "<b>Tanpa SL/TP</b> &mdash; posisi hanya ditutup saat sinyal berbalik.";
+  if (!roiKeduanya()) {
+    el.innerHTML = "<b>Tanpa SL/TP</b> &mdash; isi keduanya (TP dan SL) untuk memasang SL/TP. "
+      + "Tanpa itu, posisi hanya ditutup saat sinyal berbalik.";
     return;
   }
+  const tp = +pilih("c_tp_roi").value, sl = +pilih("c_sl_roi").value;
+  const amt = parseFloat(pilih("c_amount").value);
   if (!amt || !hargaTerakhir || feeTerakhir === null) { el.innerHTML = "&mdash;"; return; }
-  const p = pratinjauRR(hargaTerakhir, amt, atrTerakhir, feeTerakhir, rr, k || 2, SL_MIN_FEE_MULT_JS);
-  el.innerHTML = `Kalau masuk sekarang: <b class="merah-t">SL &minus;${(p.s*100).toFixed(2)}%</b> `
-    + `(rugi bersih &minus;${p.rugi.toFixed(2)} USDT) &middot; `
-    + `<b class="hijau-t">TP +${(p.t*100).toFixed(2)}%</b> (untung bersih +${p.untung.toFixed(2)} USDT). `
-    + `Jarak SL dari ${p.pakaiAtr ? k + " &times; ATR" + periodeAtr : "batas bawah fee (ATR lebih kecil)"}; `
-    + `Untung : rugi = ${u} : ${r}, artinya untung bersih = ${+rr.toFixed(4)} &times; rugi bersih. `
-    + `fee ${(feeTerakhir*100).toFixed(3)}%/sisi. Dipasang di BURSA, tetap aktif walau bot mati.`;
+  const asumsi = !leverageAcuan, lev = leverageAcuan || 20;
+  const p = pratinjauROI(hargaTerakhir, amt, lev, feeTerakhir, tp, sl);
+  const u = v => v.toFixed(2), pc = (v, d=2) => v.toFixed(d);
+  let h = `Leverage <b>${lev}x</b>${asumsi ? " (asumsi, belum terbaca dari bursa)" : ""} &middot; `
+    + `margin ${u(p.margin)} USDT &middot; fee ${pc(feeTerakhir*100,3)}%/sisi = ${u(p.biaya)} USDT bolak-balik `
+    + `(setara ROI ${pc(p.roiFee)}%).<br>`;
+  if (p.untungBersih > 0) {
+    h += `<b class="hijau-t">TP ROI +${tp}%</b> = harga +${pc(p.t*100,3)}% &rarr; untung kotor +${u(p.untungKotor)}, `
+      + `dikurangi fee ${u(p.biaya)} &rarr; <b class="hijau-t">BERSIH +${u(p.untungBersih)} USDT</b> `
+      + `(ROI bersih +${pc(p.roiBersihTp)}%). Masih untung setelah fee.<br>`;
+  } else {
+    h += `<b class="merah-t">TP ROI +${tp}% TIDAK menutup fee</b>: untung kotor +${u(p.untungKotor)} `
+      + `dikurangi fee ${u(p.biaya)} &rarr; bersih ${u(p.untungBersih)} USDT. TP kena pun tetap RUGI &mdash; `
+      + `naikkan di atas ROI ${pc(p.roiFee)}%.<br>`;
+  }
+  h += `<b class="merah-t">SL ROI &minus;${sl}%</b> = harga &minus;${pc(p.s*100,3)}% &rarr; rugi &minus;${u(p.rugiKotor)} `
+    + `ditambah fee ${u(p.biaya)} &rarr; <b class="merah-t">TOTAL &minus;${u(p.rugiTotal)} USDT</b> `
+    + `(ROI &minus;${pc(p.roiTotalSl)}%).<br>`;
+  if (p.impas !== null) {
+    h += `Rasio bersih &asymp; ${pc(p.rasio)} : 1 &rarr; perlu menang minimal <b>${pc(p.impas*100,1)}%</b> trade untuk impas.`;
+  }
+  if (p.slDiBawahFee) {
+    h += `<br><span class="kuning-t">Perhatian: gerak harga SL (${pc(p.s*100,3)}%) lebih kecil dari fee bolak-balik `
+      + `(${pc(2*feeTerakhir*100,3)}%) &mdash; fee lebih besar dari rugi harganya sendiri, dan gerakan sekecil ini `
+      + `bisa terjadi dalam hitungan detik.</span>`;
+  }
+  el.innerHTML = h;
 }
 
 // Notional = amount x HARGA TERAKHIR dari bursa (ticker "last"), BUKAN
@@ -915,7 +948,7 @@ function hitungNotional() {
   el.innerHTML = leverageTerakhir
     ? `<b>${notional.toFixed(2)} USDT</b> &middot; margin ${(notional/leverageTerakhir).toFixed(2)}`
     : `<b>${notional.toFixed(2)} USDT</b>`;
-  hitungRR();
+  hitungSlTp();
 }
 
 // Kurva ekuitas, digambar manual tanpa library.
@@ -1146,13 +1179,16 @@ function panelSlTp(d, modeSlTp) {
   const sl = ords.find(o => (o.type || "").startsWith("STOP"));
   const tp = ords.find(o => (o.type || "").startsWith("TAKE_PROFIT"));
   const jarak = v => (entry && v) ? ((v - entry) / entry * 100) : null;
+  const lev = d.position && d.position.leverage;
   const sel = (label, o, kelas) => {
     if (!o) return `<div class="item"><div class="label">${label}</div><div class="val">&mdash;</div>
       <div class="note">tidak ada di bursa</div></div>`;
     const j = jarak(o.trigger_price);
     return `<div class="item"><div class="label">${label}</div>
       <div class="val ${kelas}">${o.trigger_price ? o.trigger_price.toFixed(2) : "?"}</div>
-      <div class="note">${j !== null ? (j >= 0 ? "+" : "\u2212") + Math.abs(j).toFixed(2) + "% dari harga masuk" : ""}</div></div>`;
+      <div class="note">${j !== null ? "harga " + (j >= 0 ? "+" : "\u2212") + Math.abs(j).toFixed(3) + "%"
+        + (lev ? " &middot; <b>ROI " + (j >= 0 ? "+" : "\u2212") + Math.abs(j * lev).toFixed(2) + "%</b> (" + lev.toFixed(0) + "x)" : "")
+        : ""}</div></div>`;
   };
   let h = "";
   if (!sl && modeSlTp) {
@@ -1186,8 +1222,9 @@ function render(d) {
   if (typeof d.atr === "number") atrTerakhir = d.atr;
   if (typeof d.fee_taker === "number") feeTerakhir = d.fee_taker;
   if (d.atr_period) periodeAtr = d.atr_period;
+  leverageAcuan = leverageTerakhir || d.leverage_terakhir || null;
   hitungNotional();
-  hitungRR();
+  hitungSlTp();
 
   const b = d.bot || {};
   pilih("btn_start").disabled = !!b.running;
@@ -1206,14 +1243,17 @@ function render(d) {
 
   // ---- Status bot + channel breakout ----
   const c = d.channel;
-  const modeSlTp = !!(b.running && b.cmd && b.cmd.includes("--risk-reward"));
+  const modeSlTp = !!(b.running && b.cmd && (b.cmd.includes("--risk-reward") || b.cmd.includes("--tp-roi-pct")));
+  const angkaFlag = nama => ((b.cmd || "").match(new RegExp("--" + nama + " (\\S+)")) || [,"?"])[1].replace(/\.0$/, "");
   h += `<h2>Status</h2><div class="panel"><div class="grid">
     <div class="item"><div class="label">Proses bot</div><div class="val">
       <span class="chip ${b.running?"on":"off"}">${b.running?"JALAN":"MATI"}</span></div>
       <div class="note">${b.running && b.cmd ? (b.cmd.includes("--stop-after-take-profit")
         ? "mode: sekali saja" : (b.cmd.includes("--reentry-mode midline")
           ? "mode: berulang dari tengah" : "mode: berulang, tunggu berbalik")) + (modeSlTp
-        ? " &middot; SL/TP " + (b.cmd.match(/--risk-reward (\S+)/) || [,"?"])[1].replace(/\.0$/, "") + ":1"
+        ? (b.cmd.includes("--tp-roi-pct")
+          ? " &middot; TP ROI +" + angkaFlag("tp-roi-pct") + "% / SL ROI \u2212" + angkaFlag("sl-roi-pct") + "%"
+          : " &middot; SL/TP " + angkaFlag("risk-reward") + ":1")
         : " &middot; tanpa SL/TP") : ""}</div></div>
     <div class="item"><div class="label">Posisi di bursa</div><div class="val ${
       d.position?(d.position.side==="long"?"hijau-t":"merah-t"):""}">${
