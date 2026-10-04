@@ -405,6 +405,8 @@ def build_bot_command(cfg: dict) -> list[str]:
         cmd += ["--tp-roi-pct", str(float(cfg["tp_roi_pct"])), "--sl-roi-pct", str(float(cfg["sl_roi_pct"]))]
     if cfg.get("reentry_mode") == "midline":
         cmd += ["--reentry-mode", "midline"]
+    if cfg.get("regime_filter"):
+        cmd += ["--regime-filter"]
     return cmd
 
 
@@ -795,6 +797,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <option value="berulang">Berulang &mdash; tunggu sinyal berbalik</option>
         </select></label>
       <span class="sub" id="ket_mode_tp" style="font-size:11px"></span>
+      <label class="cek"><input type="checkbox" id="c_regime"> Filter regime (entry hanya saat trend)</label>
       <button class="pri" id="btn_start" onclick="mulai()">Mulai bot</button>
       <button class="bahaya" id="btn_stop" onclick="hentikan()">Hentikan (ala Ctrl+C)</button>
       <span id="pesan" class="sub"></span>
@@ -819,6 +822,7 @@ function konfig() {
     stop_after_take_profit: pilih("c_mode_tp").value === "sekali",
     reentry_mode: pilih("c_mode_tp").value === "tengah" ? "midline" : null,
     backfill_bars: +pilih("c_backfill").value || null,
+    regime_filter: pilih("c_regime").checked,
   };
 }
 

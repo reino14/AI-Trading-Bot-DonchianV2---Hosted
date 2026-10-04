@@ -28,6 +28,8 @@ import pandas as pd
 
 from src.execution.broker import Broker, MockBroker
 from src.strategy.donchian_close_futures import DonchianCloseFuturesParams, DonchianCloseFuturesStrategy
+from src.strategy.regime_detector import detect_regime
+from src.strategy.regime_filtered import RegimeFilteredStrategy
 from src.runner.paper import PaperRunner
 
 
@@ -72,6 +74,28 @@ def make_channel_fn(lookback: int):
             return None
         window = [b["close"] for b in bars[-(lookback + 1):-1]]
         return max(window), min(window)
+    return fn
+
+
+#: buffer PaperRunner saat filter regime aktif (default runner 500) -- lihat
+#: BATASAN di src/strategy/regime_filtered.py. 1500 bar 1h = ~62 hari.
+REGIME_BUFFER_BARS = 1500
+
+
+def make_debug_fn(lookback: int, regime_strategy: RegimeFilteredStrategy | None = None):
+    """Debug channel seperti biasa, plus regime terkini kalau filter aktif --
+    dihitung dari buffer YANG SAMA dengan sinyal sungguhan."""
+    channel_fn = make_channel_debug_fn(lookback)
+    if regime_strategy is None:
+        return channel_fn
+
+    def fn(bars: list[dict]) -> str:
+        text = channel_fn(bars)
+        df = pd.DataFrame(bars)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        r = detect_regime(df.set_index("timestamp"), regime_strategy.cfg).iloc[-1]
+        return (f"{text}  [regime] {r['regime']} "
+                f"(ADX={r['adx']:.1f} CHOP={r['chop']:.1f} ER={r['er']:.2f})")
     return fn
 
 
@@ -120,6 +144,10 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
     reentry_mode = getattr(args, "reentry_mode", "reversal")
     params = DonchianCloseFuturesParams(lookback=args.lookback)
     strategy = DonchianCloseFuturesStrategy(params)
+    regime_strategy = None
+    if getattr(args, "regime_filter", False):
+        regime_strategy = RegimeFilteredStrategy(strategy)
+        strategy = regime_strategy
     print(f"  (Strategi: {strategy.describe()})")
     print(f"  (ALLOWS_SHORT={strategy.ALLOWS_SHORT} -- wajib True untuk futures selalu-di-pasar ini)")
 
@@ -155,7 +183,8 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
         session_hours=args.session_hours, min_entry_buffer_hours=args.min_entry_buffer_hours,
         take_profit_pct=args.take_profit_pct, stop_after_take_profit=args.stop_after_take_profit,
         backfill_bars=args.backfill_bars, live_take_profit_poll_seconds=args.live_take_profit_poll_seconds,
-        debug_info_fn=make_channel_debug_fn(args.lookback),
+        debug_info_fn=make_debug_fn(args.lookback, regime_strategy),
+        buffer_size=REGIME_BUFFER_BARS if regime_strategy is not None else 500,
         risk_reward=args.risk_reward, sl_atr_mult=args.sl_atr_mult, sl_atr_period=args.sl_atr_period,
         sl_min_fee_mult=args.sl_min_fee_mult, bracket_poll_seconds=args.bracket_poll_seconds,
         reentry_mode=reentry_mode,
@@ -220,6 +249,10 @@ def main() -> None:
                     help="setelah posisi ditutup TP/SL, kapan boleh masuk lagi ke arah YANG SAMA: "
                          "'reversal' (default) = tunggu sinyal berbalik; 'midline' = siap begitu harga "
                          "kembali ke tengah channel, lalu masuk saat ada breakout baru searah")
+    p.add_argument("--regime-filter", action="store_true",
+                    help="tahan ENTRY baru sampai market regime TREND searah sinyal "
+                         "(ADX/Choppiness/Efficiency Ratio, lihat src/strategy/regime_detector.py). "
+                         "Posisi yang sudah terbuka TIDAK ditutup paksa karena regime.")
     p.add_argument("--replay-historical", type=int, default=None,
                     help="jumlah bar 1H BTC SUNGGUHAN terakhir untuk diputar ulang lewat "
                          "process_bar() di mode --mock -- validasi kuat sebelum --live. "
