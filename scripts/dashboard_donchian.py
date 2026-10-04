@@ -784,8 +784,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="f"><label>Amount (BTC)</label><input id="c_amount" type="number" step="0.001" value="0.001" oninput="hitungNotional()">
         <div class="sub" id="ket_amount" style="font-size:11px;margin-top:5px;line-height:1.5">&mdash;</div></div>
       <div class="f"><label>Session (jam)</label><input id="c_session" type="number" step="0.5" value="24"></div>
-      <div class="f"><label>Take profit (ROI kotor %)</label><input id="c_tp_roi" type="number" step="0.5" min="0" value="5" oninput="hitungNotional()"></div>
-      <div class="f"><label>Stop loss (ROI kotor %)</label><input id="c_sl_roi" type="number" step="0.5" min="0" value="1.5" oninput="hitungNotional()"></div>
+      <div class="f"><label>Take profit (% dari posisi)</label><input id="c_tp_roi" type="number" step="0.05" min="0" value="0.5" oninput="hitungNotional()"></div>
+      <div class="f"><label>Stop loss (% dari posisi)</label><input id="c_sl_roi" type="number" step="0.05" min="0" value="0.25" oninput="hitungNotional()"></div>
       <div class="f"><label>Backfill (bar)</label><input id="c_backfill" type="number" value="200"></div>
     </div>
     <div class="sub" id="ket_rr" style="font-size:12px;margin-top:10px;line-height:1.55">&mdash;</div>
@@ -817,8 +817,10 @@ function konfig() {
     symbol: pilih("c_symbol").value, timeframe: pilih("c_timeframe").value,
     lookback: +pilih("c_lookback").value, amount: +pilih("c_amount").value,
     session_hours: +pilih("c_session").value || null,
-    tp_roi_pct: roiKeduanya() ? +pilih("c_tp_roi").value : null,
-    sl_roi_pct: roiKeduanya() ? +pilih("c_sl_roi").value : null,
+    // Input = % gerak harga (= % dari nilai posisi). Bot menerima ROI
+    // terhadap margin, jadi dikali leverage di sini.
+    tp_roi_pct: roiKeduanya() ? keRoi(+pilih("c_tp_roi").value) : null,
+    sl_roi_pct: roiKeduanya() ? keRoi(+pilih("c_sl_roi").value) : null,
     stop_after_take_profit: pilih("c_mode_tp").value === "sekali",
     reentry_mode: pilih("c_mode_tp").value === "tengah" ? "midline" : null,
     backfill_bars: +pilih("c_backfill").value || null,
@@ -887,6 +889,11 @@ function pratinjauROI(harga, jumlah, lev, fee, tpPct, slPct) {
   };
 }
 
+// % dari posisi -> ROI terhadap margin (yang dipakai bot): dikali leverage.
+function keRoi(persenPosisi) {
+  return Math.round(persenPosisi * (leverageAcuan || 20) * 100) / 100;
+}
+
 function roiKeduanya() {
   return +pilih("c_tp_roi").value > 0 && +pilih("c_sl_roi").value > 0;
 }
@@ -904,29 +911,34 @@ function hitungSlTp() {
       + "Tanpa itu, posisi hanya ditutup saat sinyal berbalik.";
     return;
   }
-  const tp = +pilih("c_tp_roi").value, sl = +pilih("c_sl_roi").value;
+  const tpH = +pilih("c_tp_roi").value, slH = +pilih("c_sl_roi").value;
   const amt = parseFloat(pilih("c_amount").value);
   if (!amt || !hargaTerakhir || feeTerakhir === null) { el.innerHTML = "&mdash;"; return; }
   const asumsi = !leverageAcuan, lev = leverageAcuan || 20;
+  const tp = keRoi(tpH), sl = keRoi(slH);
   const p = pratinjauROI(hargaTerakhir, amt, lev, feeTerakhir, tp, sl);
   const u = v => v.toFixed(2), pc = (v, d=2) => v.toFixed(d);
   let h = `Leverage <b>${lev}x</b>${asumsi ? " (asumsi, belum terbaca dari bursa)" : ""} &middot; `
     + `margin ${u(p.margin)} USDT &middot; fee ${pc(feeTerakhir*100,3)}%/sisi = ${u(p.biaya)} USDT bolak-balik `
     + `(setara ROI ${pc(p.roiFee)}%).<br>`;
   if (p.untungBersih > 0) {
-    h += `<b class="hijau-t">TP ROI +${tp}%</b> = harga +${pc(p.t*100,3)}% &rarr; untung kotor +${u(p.untungKotor)}, `
+    h += `<b class="hijau-t">TP +${tpH}% dari posisi</b> (ROI +${pc(tp,1)}% dari margin) &rarr; untung kotor +${u(p.untungKotor)}, `
       + `dikurangi fee ${u(p.biaya)} &rarr; <b class="hijau-t">BERSIH +${u(p.untungBersih)} USDT</b> `
       + `(ROI bersih +${pc(p.roiBersihTp)}%). Masih untung setelah fee.<br>`;
   } else {
-    h += `<b class="merah-t">TP ROI +${tp}% TIDAK menutup fee</b>: untung kotor +${u(p.untungKotor)} `
+    h += `<b class="merah-t">TP +${tpH}% TIDAK menutup fee</b>: untung kotor +${u(p.untungKotor)} `
       + `dikurangi fee ${u(p.biaya)} &rarr; bersih ${u(p.untungBersih)} USDT. TP kena pun tetap RUGI &mdash; `
-      + `naikkan di atas ROI ${pc(p.roiFee)}%.<br>`;
+      + `naikkan di atas ${pc(2*feeTerakhir*100,3)}% dari posisi.<br>`;
   }
-  h += `<b class="merah-t">SL ROI &minus;${sl}%</b> = harga &minus;${pc(p.s*100,3)}% &rarr; rugi &minus;${u(p.rugiKotor)} `
+  h += `<b class="merah-t">SL &minus;${slH}% dari posisi</b> (ROI &minus;${pc(sl,1)}% dari margin) &rarr; rugi &minus;${u(p.rugiKotor)} `
     + `ditambah fee ${u(p.biaya)} &rarr; <b class="merah-t">TOTAL &minus;${u(p.rugiTotal)} USDT</b> `
     + `(ROI &minus;${pc(p.roiTotalSl)}%).<br>`;
   if (p.impas !== null) {
     h += `Rasio bersih &asymp; ${pc(p.rasio)} : 1 &rarr; perlu menang minimal <b>${pc(p.impas*100,1)}%</b> trade untuk impas.`;
+  }
+  if (sl >= 90) {
+    h += `<br><span class="merah-t"><b>SL terlalu jauh:</b> &minus;${slH}% di leverage ${lev}x = &minus;${pc(sl,1)}% margin &mdash; `
+      + `posisi TERLIKUIDASI sebelum SL kena. Maksimal sekitar ${pc(90/lev,2)}% dari posisi.</span>`;
   }
   if (p.slDiBawahFee) {
     h += `<br><span class="kuning-t">Perhatian: gerak harga SL (${pc(p.s*100,3)}%) lebih kecil dari fee bolak-balik `
