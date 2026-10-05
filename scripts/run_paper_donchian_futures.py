@@ -22,14 +22,18 @@ ke wilayah yang sudah terbukti buruk di scan sebelumnya.
 
 import argparse
 import asyncio
+import signal
+import time
 from pathlib import Path
 
 import pandas as pd
 
 from src.execution.broker import Broker, MockBroker
+from src.strategy.base import Position
 from src.strategy.donchian_close_futures import DonchianCloseFuturesParams, DonchianCloseFuturesStrategy
 from src.strategy.regime_detector import detect_regime
 from src.strategy.regime_filtered import RegimeFilteredStrategy
+import src.runner.paper as paper_module
 from src.runner.paper import PaperRunner
 
 
@@ -138,6 +142,74 @@ async def replay_historical(runner: PaperRunner, n_bars: int, data_dir: str, sym
         print("  jendela ini. Coba n_bars lebih besar sebelum menyimpulkan pipa tidak jalan.")
 
 
+def use_price_pct_brackets() -> None:
+    """
+    Ubah arti --tp-roi-pct/--sl-roi-pct jadi % PERGERAKAN HARGA (= % dari nilai
+    posisi), TIDAK bergantung leverage. Caranya: angka dikali leverage posisi
+    SEBENARNYA saat entry sebelum masuk ke compute_bracket_roi() asli, yang
+    lalu membaginya lagi dengan leverage yang sama -> harga SL/TP tetap.
+    paper.py tidak diubah sama sekali.
+    """
+    asli = paper_module.compute_bracket_roi
+
+    def by_price(entry, direction, leverage, tp_roi, sl_roi, fee_side):
+        lev = leverage if leverage and leverage > 0 else 1.0
+        return asli(entry, direction, leverage, tp_roi * lev, sl_roi * lev, fee_side)
+
+    paper_module.compute_bracket_roi = by_price
+
+
+def _sigterm_to_keyboard_interrupt(signum, frame):
+    # Dashboard (Linux) menghentikan bot dengan SIGTERM. Default Python
+    # langsung mati tanpa beres-beres; di sini diperlakukan sama dengan Ctrl+C.
+    raise KeyboardInterrupt
+
+
+async def close_position_on_stop(runner: PaperRunner, attempts: int = 5, wait_seconds: float = 3.0) -> None:
+    """
+    Dipanggil SETELAH loop utama berhenti (tombol Hentikan / Ctrl+C / SIGTERM).
+    Posisi di bursa ditutup lewat jalur order yang SAMA dengan bot
+    (_handle_signal_change), dicek ulang ke bursa tiap percobaan. Kalau tetap
+    gagal, SL dipasang ulang supaya posisi tidak tertinggal tanpa pelindung.
+    """
+    print("\n=== Bot dihentikan -- menutup posisi di bursa (--close-on-stop) ===")
+    for i in range(1, attempts + 1):
+        try:
+            runner._sync_position_from_exchange()
+        except Exception as e:
+            print(f"  [stop] gagal membaca posisi bursa ({e})")
+        if runner._current_position == Position.FLAT:
+            n = runner._cancel_conditional_orders_safely("bot dihentikan, posisi sudah flat")
+            print(f"  [stop] posisi FLAT di bursa{' -- sisa SL/TP dibersihkan' if n and n > 0 else ''}. Selesai.")
+            return
+        try:
+            price = runner.broker.fetch_current_price(runner.symbol)
+        except Exception as e:
+            print(f"  [stop] gagal ambil harga ({e}) -- coba lagi")
+            time.sleep(wait_seconds)
+            continue
+        print(f"  [stop] percobaan {i}/{attempts}: tutup posisi {runner._current_position} di sekitar {price:.2f}")
+        try:
+            await runner._handle_signal_change(Position.FLAT, override_price=price)
+        except Exception as e:
+            print(f"  [stop] order penutup gagal ({e})")
+        time.sleep(wait_seconds)
+
+    try:
+        runner._sync_position_from_exchange()
+    except Exception:
+        pass
+    if runner._current_position != Position.FLAT:
+        print("!" * 70)
+        print(f"  [stop] POSISI MASIH TERBUKA setelah {attempts} percobaan -- TUTUP MANUAL di Binance.")
+        if runner._bracket:
+            runner._restore_stop_loss()
+        print("!" * 70)
+    else:
+        runner._cancel_conditional_orders_safely("bot dihentikan, posisi sudah flat")
+        print("  [stop] posisi FLAT di bursa. Selesai.")
+
+
 def build_runner(args: argparse.Namespace) -> PaperRunner:
     # getattr: pemanggil lama yang menyusun Namespace sendiri (tanpa field
     # baru ini) tetap jalan dengan perilaku lama, bukan crash.
@@ -161,6 +233,10 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
     if args.take_profit_pct is not None:
         print(f"  (Take-profit: {args.take_profit_pct:.1%}, "
               f"{'BERHENTI TOTAL setelah kena' if args.stop_after_take_profit else 'tahan arah sama sampai sinyal berbalik'})")
+    if getattr(args, "tp_sl_price_pct", False) and getattr(args, "tp_roi_pct", None) is not None:
+        use_price_pct_brackets()
+        print(f"  (TP/SL dalam % PERGERAKAN HARGA = % dari nilai posisi: TP +{args.tp_roi_pct:g}%, "
+              f"SL -{args.sl_roi_pct:g}% -- tidak bergantung leverage.)")
     if getattr(args, "tp_roi_pct", None) is not None:
         tahan_roi = ("masuk lagi setelah harga kembali ke tengah channel lalu breakout baru searah"
                      if reentry_mode == "midline" else "tahan arah sampai sinyal berbalik")
@@ -245,6 +321,12 @@ def main() -> None:
     p.add_argument("--sl-roi-pct", type=float, default=None,
                     help="STOP LOSS sebagai ROI KOTOR terhadap margin, dalam PERSEN (mis. 1.5 = -1,5%%). "
                          "Fee bolak-balik DITAMBAHKAN ke kerugian ini saat SL kena.")
+    p.add_argument("--tp-sl-price-pct", action="store_true",
+                    help="artikan --tp-roi-pct/--sl-roi-pct sebagai %% PERGERAKAN HARGA (= %% dari nilai "
+                         "posisi), bukan ROI terhadap margin. Mis. --tp-roi-pct 5 = harga +5%%.")
+    p.add_argument("--close-on-stop", action="store_true",
+                    help="saat bot dihentikan (Ctrl+C / tombol Hentikan / SIGTERM), TUTUP posisi di bursa "
+                         "dan bersihkan SL/TP. Tanpa ini posisi dibiarkan terbuka dengan SL/TP di bursa.")
     p.add_argument("--reentry-mode", choices=["reversal", "midline"], default="reversal",
                     help="setelah posisi ditutup TP/SL, kapan boleh masuk lagi ke arah YANG SAMA: "
                          "'reversal' (default) = tunggu sinyal berbalik; 'midline' = siap begitu harga "
@@ -306,7 +388,18 @@ def main() -> None:
             print("lewat pipa ini secara otomatis (rekomendasi: coba ini dulu).")
     else:
         print(f"\n=== Mode LIVE (Demo Trading) -- {args.symbol} @ {args.timeframe} ===")
-        asyncio.run(runner.run())
+        signal.signal(signal.SIGTERM, _sigterm_to_keyboard_interrupt)
+        try:
+            asyncio.run(runner.run())
+        except KeyboardInterrupt:
+            if args.close_on_stop:
+                # Abaikan sinyal stop berikutnya selama menutup -- jangan
+                # sampai proses penutupan sendiri terpotong di tengah jalan.
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+                asyncio.run(close_position_on_stop(runner))
+            else:
+                print("\n=== Bot dihentikan -- posisi & SL/TP di bursa DIBIARKAN (tanpa --close-on-stop) ===")
 
 
 if __name__ == "__main__":

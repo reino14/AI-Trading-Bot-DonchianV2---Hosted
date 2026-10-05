@@ -403,10 +403,15 @@ def build_bot_command(cfg: dict) -> list[str]:
     # SL/TP dari ROI kotor terhadap margin (persen).
     if cfg.get("tp_roi_pct") and cfg.get("sl_roi_pct"):
         cmd += ["--tp-roi-pct", str(float(cfg["tp_roi_pct"])), "--sl-roi-pct", str(float(cfg["sl_roi_pct"]))]
+        # Angka dari dashboard = % dari nilai posisi; bot mengonversinya
+        # sendiri pakai leverage posisi SEBENARNYA saat entry.
+        cmd += ["--tp-sl-price-pct"]
     if cfg.get("reentry_mode") == "midline":
         cmd += ["--reentry-mode", "midline"]
     if cfg.get("regime_filter"):
         cmd += ["--regime-filter"]
+    if cfg.get("close_on_stop"):
+        cmd += ["--close-on-stop"]
     return cmd
 
 
@@ -798,6 +803,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </select></label>
       <span class="sub" id="ket_mode_tp" style="font-size:11px"></span>
       <label class="cek"><input type="checkbox" id="c_regime"> Filter regime (entry hanya saat trend)</label>
+      <label class="cek"><input type="checkbox" id="c_close_stop" checked> Tutup posisi saat bot dihentikan</label>
       <button class="pri" id="btn_start" onclick="mulai()">Mulai bot</button>
       <button class="bahaya" id="btn_stop" onclick="hentikan()">Hentikan (ala Ctrl+C)</button>
       <span id="pesan" class="sub"></span>
@@ -817,14 +823,15 @@ function konfig() {
     symbol: pilih("c_symbol").value, timeframe: pilih("c_timeframe").value,
     lookback: +pilih("c_lookback").value, amount: +pilih("c_amount").value,
     session_hours: +pilih("c_session").value || null,
-    // Input = % gerak harga (= % dari nilai posisi). Bot menerima ROI
-    // terhadap margin, jadi dikali leverage di sini.
-    tp_roi_pct: roiKeduanya() ? keRoi(+pilih("c_tp_roi").value) : null,
-    sl_roi_pct: roiKeduanya() ? keRoi(+pilih("c_sl_roi").value) : null,
+    // Input = % gerak harga (= % dari nilai posisi), dikirim apa adanya +
+    // flag --tp-sl-price-pct. Bot yang mengonversi pakai leverage SEBENARNYA.
+    tp_roi_pct: roiKeduanya() ? +pilih("c_tp_roi").value : null,
+    sl_roi_pct: roiKeduanya() ? +pilih("c_sl_roi").value : null,
     stop_after_take_profit: pilih("c_mode_tp").value === "sekali",
     reentry_mode: pilih("c_mode_tp").value === "tengah" ? "midline" : null,
     backfill_bars: +pilih("c_backfill").value || null,
     regime_filter: pilih("c_regime").checked,
+    close_on_stop: pilih("c_close_stop").checked,
   };
 }
 
@@ -889,7 +896,7 @@ function pratinjauROI(harga, jumlah, lev, fee, tpPct, slPct) {
   };
 }
 
-// % dari posisi -> ROI terhadap margin (yang dipakai bot): dikali leverage.
+// % dari posisi -> ROI terhadap margin, HANYA untuk teks pratinjau.
 function keRoi(persenPosisi) {
   return Math.round(persenPosisi * (leverageAcuan || 20) * 100) / 100;
 }
