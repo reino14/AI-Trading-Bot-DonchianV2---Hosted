@@ -228,6 +228,17 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
         print("  (Broker: MockBroker -- TIDAK menyentuh jaringan sama sekali)")
     else:
         broker = Broker(exchange_id="binanceusdm", testnet=True)
+        lev_target = getattr(args, "leverage", None)
+        if lev_target is not None:
+            # Broker tidak punya method set_leverage -- panggil ccxt langsung
+            # (pola yang sama dengan dashboard). Gagal = bot TIDAK jalan,
+            # supaya tidak diam-diam trading di leverage lama.
+            try:
+                broker.exchange.set_leverage(int(lev_target), args.symbol)
+            except Exception as e:
+                raise SystemExit(f"Gagal set leverage {lev_target}x di Binance ({e}). Bot TIDAK dijalankan. "
+                                 f"Kalau ada posisi terbuka, tutup dulu lalu coba lagi.")
+            print(f"  (Leverage {args.symbol} di bursa diset ke {int(lev_target)}x)")
         print("  (Broker: Binance Demo Trading, futures -- demo-fapi.binance.com)")
 
     if args.take_profit_pct is not None:
@@ -324,6 +335,9 @@ def main() -> None:
     p.add_argument("--tp-sl-price-pct", action="store_true",
                     help="artikan --tp-roi-pct/--sl-roi-pct sebagai %% PERGERAKAN HARGA (= %% dari nilai "
                          "posisi), bukan ROI terhadap margin. Mis. --tp-roi-pct 5 = harga +5%%.")
+    p.add_argument("--leverage", type=int, default=None,
+                    help="set leverage simbol ini di Binance sebelum bot mulai (mis. 1 = tanpa leverage). "
+                         "Tanpa ini, bot memakai leverage yang sedang terpasang di Binance.")
     p.add_argument("--close-on-stop", action="store_true",
                     help="saat bot dihentikan (Ctrl+C / tombol Hentikan / SIGTERM), TUTUP posisi di bursa "
                          "dan bersihkan SL/TP. Tanpa ini posisi dibiarkan terbuka dengan SL/TP di bursa.")

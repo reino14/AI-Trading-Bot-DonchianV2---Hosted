@@ -410,6 +410,8 @@ def build_bot_command(cfg: dict) -> list[str]:
         cmd += ["--reentry-mode", "midline"]
     if cfg.get("regime_filter"):
         cmd += ["--regime-filter"]
+    if cfg.get("leverage"):
+        cmd += ["--leverage", str(int(cfg["leverage"]))]
     if cfg.get("close_on_stop"):
         cmd += ["--close-on-stop"]
     return cmd
@@ -792,6 +794,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="f"><label>Take profit (% dari posisi)</label><input id="c_tp_roi" type="number" step="0.05" min="0" value="0.5" oninput="hitungNotional()"></div>
       <div class="f"><label>Stop loss (% dari posisi)</label><input id="c_sl_roi" type="number" step="0.05" min="0" value="0.25" oninput="hitungNotional()"></div>
       <div class="f"><label>Backfill (bar)</label><input id="c_backfill" type="number" value="200"></div>
+      <div class="f"><label>Leverage (x)</label><input id="c_leverage" type="number" min="1" max="125" step="1" value="1" oninput="hitungNotional()"></div>
     </div>
     <div class="sub" id="ket_rr" style="font-size:12px;margin-top:10px;line-height:1.55">&mdash;</div>
     <div class="baris">
@@ -830,6 +833,7 @@ function konfig() {
     stop_after_take_profit: pilih("c_mode_tp").value === "sekali",
     reentry_mode: pilih("c_mode_tp").value === "tengah" ? "midline" : null,
     backfill_bars: +pilih("c_backfill").value || null,
+    leverage: Math.max(1, Math.round(+pilih("c_leverage").value || 1)),
     regime_filter: pilih("c_regime").checked,
     close_on_stop: pilih("c_close_stop").checked,
   };
@@ -898,7 +902,8 @@ function pratinjauROI(harga, jumlah, lev, fee, tpPct, slPct) {
 
 // % dari posisi -> ROI terhadap margin, HANYA untuk teks pratinjau.
 function keRoi(persenPosisi) {
-  return Math.round(persenPosisi * (leverageAcuan || 20) * 100) / 100;
+  const lev = Math.max(1, Math.round(+pilih("c_leverage").value || 1));
+  return Math.round(persenPosisi * lev * 100) / 100;
 }
 
 function roiKeduanya() {
@@ -921,7 +926,8 @@ function hitungSlTp() {
   const tpH = +pilih("c_tp_roi").value, slH = +pilih("c_sl_roi").value;
   const amt = parseFloat(pilih("c_amount").value);
   if (!amt || !hargaTerakhir || feeTerakhir === null) { el.innerHTML = "&mdash;"; return; }
-  const asumsi = !leverageAcuan, lev = leverageAcuan || 20;
+  // Pratinjau memakai leverage yang AKAN diset bot (field Leverage).
+  const asumsi = false, lev = Math.max(1, Math.round(+pilih("c_leverage").value || 1));
   const tp = keRoi(tpH), sl = keRoi(slH);
   const p = pratinjauROI(hargaTerakhir, amt, lev, feeTerakhir, tp, sl);
   const u = v => v.toFixed(2), pc = (v, d=2) => v.toFixed(d);
@@ -968,9 +974,8 @@ function hitungNotional() {
   const amt = parseFloat(pilih("c_amount").value);
   if (!amt || !hargaTerakhir) { el.innerHTML = "&mdash;"; return; }
   const notional = amt * hargaTerakhir;
-  el.innerHTML = leverageTerakhir
-    ? `<b>${notional.toFixed(2)} USDT</b> &middot; margin ${(notional/leverageTerakhir).toFixed(2)}`
-    : `<b>${notional.toFixed(2)} USDT</b>`;
+  const levInput = Math.max(1, Math.round(+pilih("c_leverage").value || 1));
+  el.innerHTML = `<b>${notional.toFixed(2)} USDT</b> &middot; margin ${(notional/levInput).toFixed(2)} (${levInput}x)`;
   hitungSlTp();
 }
 
