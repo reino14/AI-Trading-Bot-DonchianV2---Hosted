@@ -35,7 +35,27 @@ from dataclasses import asdict
 import pandas as pd
 
 from src.strategy.base import Position, Strategy
-from src.strategy.regime_detector import RegimeConfig, detect_regime
+from src.strategy.regime_detector import RegimeConfig, detect_regime, regime_from_higher_tf
+
+import re
+
+_TF_RE = re.compile(r"^(\d+)([mh])$")
+
+#: jumlah candle timeframe-regime minimal supaya EMA50/ADX14 + konfirmasi stabil
+REGIME_WARMUP_HTF_BARS = 70
+
+
+def tf_minutes(tf: str) -> int:
+    """'5m' -> 5, '2h' -> 120. Format bebas: <angka>m atau <angka>h."""
+    m = _TF_RE.match(str(tf).strip().lower())
+    if not m or int(m.group(1)) <= 0:
+        raise ValueError(f"timeframe tidak valid: {tf!r} -- pakai format seperti 5m, 15m, 1h, 4h")
+    return int(m.group(1)) * (60 if m.group(2) == "h" else 1)
+
+
+def tf_rule(tf: str) -> str:
+    """Aturan resample pandas: '15m' -> '15min'."""
+    return f"{tf_minutes(tf)}min"
 
 
 def apply_regime_filter(raw: pd.Series, regime: pd.Series) -> pd.Series:
@@ -49,23 +69,58 @@ def apply_regime_filter(raw: pd.Series, regime: pd.Series) -> pd.Series:
 
 
 class RegimeFilteredStrategy(Strategy):
-    def __init__(self, inner: Strategy, cfg: RegimeConfig | None = None):
+    def __init__(self, inner: Strategy, cfg: RegimeConfig | None = None, regime_timeframe: str | None = None):
+        """
+        regime_timeframe: None = regime dihitung di timeframe bot sendiri.
+            "5m"/"15m"/... = candle bot di-resample ke timeframe ini, regime
+            dihitung di sana, lalu dipetakan balik ke tiap candle bot --
+            hanya memakai candle regime yang SUDAH close (tanpa look-ahead).
+        """
         super().__init__(inner.params)
         self.inner = inner
         self.cfg = cfg or RegimeConfig()
         self.ALLOWS_SHORT = inner.ALLOWS_SHORT
+        if regime_timeframe is not None:
+            regime_timeframe = str(regime_timeframe).strip().lower()
+            tf_minutes(regime_timeframe)  # validasi format
+        self.regime_timeframe = regime_timeframe
+
+    def required_bars(self, bot_timeframe: str) -> int:
+        """Jumlah candle bot yang dibutuhkan supaya regime sudah 'panas'."""
+        if self.regime_timeframe is None:
+            return REGIME_WARMUP_HTF_BARS
+        ratio = max(1, tf_minutes(self.regime_timeframe) // tf_minutes(bot_timeframe))
+        return REGIME_WARMUP_HTF_BARS * ratio
+
+    def regime_series(self, df: pd.DataFrame) -> pd.Series:
+        if self.regime_timeframe is None:
+            return detect_regime(df, self.cfg)["regime"]
+        return regime_from_higher_tf(df, tf_rule(self.regime_timeframe), self.cfg)
+
+    def regime_snapshot(self, df: pd.DataFrame) -> dict:
+        """Regime + indikator dari candle regime TERAKHIR yang sudah close (untuk log)."""
+        if self.regime_timeframe is None:
+            r = detect_regime(df, self.cfg).iloc[-1]
+            tf = "tf bot"
+        else:
+            from src.strategy.regime_detector import resample_ohlcv
+            htf = detect_regime(resample_ohlcv(df, tf_rule(self.regime_timeframe)), self.cfg)
+            r = htf.iloc[-2] if len(htf) >= 2 else htf.iloc[-1]   # -2 = candle terakhir yg sudah close
+            tf = self.regime_timeframe
+        return {"tf": tf, "regime": r["regime"], "adx": r["adx"], "chop": r["chop"], "er": r["er"]}
 
     @property
     def name(self) -> str:
         return f"RegimeFiltered[{self.inner.name}]"
 
     def describe(self) -> str:
-        return f"{self.inner.describe()} + filter regime({asdict(self.cfg)})"
+        tf = self.regime_timeframe or "tf bot"
+        return f"{self.inner.describe()} + filter regime[{tf}]({asdict(self.cfg)})"
 
     def regime_frame(self, df: pd.DataFrame) -> pd.DataFrame:
         return detect_regime(df, self.cfg)
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         raw = self.inner.generate_signals(df).astype(int)
-        regime = self.regime_frame(df)["regime"]
+        regime = self.regime_series(df)
         return apply_regime_filter(raw, regime)

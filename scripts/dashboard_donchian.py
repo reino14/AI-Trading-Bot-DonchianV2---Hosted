@@ -410,6 +410,8 @@ def build_bot_command(cfg: dict) -> list[str]:
         cmd += ["--reentry-mode", "midline"]
     if cfg.get("regime_filter"):
         cmd += ["--regime-filter"]
+        if cfg.get("regime_timeframe"):
+            cmd += ["--regime-timeframe", str(cfg["regime_timeframe"])]
     if cfg.get("leverage"):
         cmd += ["--leverage", str(int(cfg["leverage"]))]
     if cfg.get("close_on_stop"):
@@ -786,7 +788,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="form">
       <div class="f"><label>Simbol</label><input id="c_symbol" value="BTC/USDT:USDT"></div>
       <div class="f"><label>Timeframe</label>
-        <select id="c_timeframe"><option>1m</option><option>5m</option><option>15m</option><option>1h</option><option>4h</option></select></div>
+        <select id="c_timeframe" onchange="cekRegimeTf()"><option>1m</option><option>5m</option><option>15m</option><option>1h</option><option>4h</option></select></div>
       <div class="f"><label>Lookback (bar)</label><input id="c_lookback" type="number" value="200"></div>
       <div class="f"><label>Amount (BTC)</label><input id="c_amount" type="number" step="0.001" value="0.001" oninput="hitungNotional()">
         <div class="sub" id="ket_amount" style="font-size:11px;margin-top:5px;line-height:1.5">&mdash;</div></div>
@@ -806,6 +808,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </select></label>
       <span class="sub" id="ket_mode_tp" style="font-size:11px"></span>
       <label class="cek"><input type="checkbox" id="c_regime"> Filter regime (entry hanya saat trend)</label>
+      <label class="cek">Regime dibaca di:
+        <input id="c_regime_tf" list="daftar_regime_tf" value="15m" placeholder="kosong = sama dengan bot"
+          oninput="cekRegimeTf()" style="width:150px;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--fg);font-size:13px;font-family:inherit">
+        <datalist id="daftar_regime_tf"><option value="5m"><option value="15m"><option value="30m"><option value="1h"><option value="4h"></datalist></label>
+      <span class="sub" id="ket_regime_tf" style="font-size:11px"></span>
       <label class="cek"><input type="checkbox" id="c_close_stop" checked> Tutup posisi saat bot dihentikan</label>
       <button class="pri" id="btn_start" onclick="mulai()">Mulai bot</button>
       <button class="bahaya" id="btn_stop" onclick="hentikan()">Hentikan (ala Ctrl+C)</button>
@@ -835,11 +842,37 @@ function konfig() {
     backfill_bars: +pilih("c_backfill").value || null,
     leverage: Math.max(1, Math.round(+pilih("c_leverage").value || 1)),
     regime_filter: pilih("c_regime").checked,
+    regime_timeframe: pilih("c_regime_tf").value.trim().toLowerCase() || null,
     close_on_stop: pilih("c_close_stop").checked,
   };
 }
 
+// Format timeframe regime: <angka>m atau <angka>h, lebih besar dari &
+// kelipatan timeframe bot. Kosong = regime dibaca di timeframe bot.
+function menitTf(tf) {
+  const m = /^(\d+)([mh])$/.exec(String(tf).trim().toLowerCase());
+  return m && +m[1] > 0 ? +m[1] * (m[2] === "h" ? 60 : 1) : null;
+}
+function cekRegimeTf() {
+  const el = pilih("ket_regime_tf"), v = pilih("c_regime_tf").value.trim();
+  if (!v) { el.textContent = "regime dibaca di timeframe bot"; el.className = "sub"; return true; }
+  const r = menitTf(v), b = menitTf(pilih("c_timeframe").value);
+  let salah = null;
+  if (r === null) salah = "format salah -- contoh: 5m, 15m, 1h";
+  else if (b !== null && r <= b) salah = "harus lebih besar dari timeframe bot";
+  else if (b !== null && r % b) salah = "harus kelipatan timeframe bot";
+  if (salah) { el.textContent = salah; el.className = "merah-t"; return false; }
+  const warm = 70 * (r / b);
+  el.textContent = `pemanasan ${warm} candle ${pilih("c_timeframe").value}` + (warm > 12000 ? " -- terlalu banyak (maks 12000)" : "");
+  el.className = warm > 12000 ? "merah-t" : "sub";
+  return warm <= 12000;
+}
+
 async function mulai() {
+  if (pilih("c_regime").checked && !cekRegimeTf()) {
+    pilih("pesan").textContent = "Timeframe regime belum valid.";
+    return;
+  }
   pilih("pesan").textContent = "mengirim...";
   const r = await fetch("/api/start", {method:"POST", body: JSON.stringify(konfig())});
   const d = await r.json();
@@ -1456,6 +1489,7 @@ async function muat() {
 }
 muat();
 setInterval(muat, 5000);
+cekRegimeTf();
 </script>
 </body>
 </html>

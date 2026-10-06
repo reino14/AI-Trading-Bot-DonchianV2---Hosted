@@ -31,7 +31,6 @@ import pandas as pd
 from src.execution.broker import Broker, MockBroker
 from src.strategy.base import Position
 from src.strategy.donchian_close_futures import DonchianCloseFuturesParams, DonchianCloseFuturesStrategy
-from src.strategy.regime_detector import detect_regime
 from src.strategy.regime_filtered import RegimeFilteredStrategy
 import src.runner.paper as paper_module
 from src.runner.paper import PaperRunner
@@ -85,6 +84,45 @@ def make_channel_fn(lookback: int):
 #: BATASAN di src/strategy/regime_filtered.py. 1500 bar 1h = ~62 hari.
 REGIME_BUFFER_BARS = 1500
 
+#: batas atas candle backfill (regime timeframe besar di bot timeframe kecil).
+#: Binance cuma memberi 1500 candle per permintaan -- di atas itu diambil
+#: bertahap lewat paged_fetch_recent_bars().
+MAX_BACKFILL_BARS = 12000
+BINANCE_KLINE_LIMIT = 1500
+
+
+def install_paged_backfill(broker, timeframe_minutes: int) -> None:
+    """
+    Broker.fetch_recent_bars() asli cukup untuk <= 1500 candle. Kalau diminta
+    lebih (regime timeframe besar), bagian TERBARU tetap diambil lewat fungsi
+    asli (jadi aturan candle-sudah-close tetap sama), lalu candle yang lebih
+    lama ditambahkan di depannya lewat ccxt fetch_ohlcv bertahap.
+    """
+    asli = broker.fetch_recent_bars
+    step = timeframe_minutes * 60_000
+
+    def paged(symbol, timeframe, limit):
+        if limit is None or limit <= BINANCE_KLINE_LIMIT:
+            return asli(symbol, timeframe, limit=limit)
+        recent = asli(symbol, timeframe, limit=BINANCE_KLINE_LIMIT)
+        if not recent:
+            return recent
+        older, need, end = [], limit - len(recent), recent[0]["timestamp"]
+        while need > 0:
+            n = min(BINANCE_KLINE_LIMIT, need)
+            raw = broker.exchange.fetch_ohlcv(symbol, timeframe, since=end - n * step, limit=n)
+            rows = [r for r in raw if r[0] < end]
+            if not rows:
+                break
+            older = [{"timestamp": int(r[0]), "open": float(r[1]), "high": float(r[2]),
+                      "low": float(r[3]), "close": float(r[4]), "volume": float(r[5])}
+                     for r in rows] + older
+            end, need = rows[0][0], need - len(rows)
+        print(f"  [backfill] {len(older)} candle lama ditambahkan bertahap (total {len(older) + len(recent)})")
+        return older + recent
+
+    broker.fetch_recent_bars = paged
+
 
 def make_debug_fn(lookback: int, regime_strategy: RegimeFilteredStrategy | None = None):
     """Debug channel seperti biasa, plus regime terkini kalau filter aktif --
@@ -97,8 +135,8 @@ def make_debug_fn(lookback: int, regime_strategy: RegimeFilteredStrategy | None 
         text = channel_fn(bars)
         df = pd.DataFrame(bars)
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        r = detect_regime(df.set_index("timestamp"), regime_strategy.cfg).iloc[-1]
-        return (f"{text}  [regime] {r['regime']} "
+        r = regime_strategy.regime_snapshot(df.set_index("timestamp"))
+        return (f"{text}  [regime {r['tf']}] {r['regime']} "
                 f"(ADX={r['adx']:.1f} CHOP={r['chop']:.1f} ER={r['er']:.2f})")
     return fn
 
@@ -218,8 +256,19 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
     strategy = DonchianCloseFuturesStrategy(params)
     regime_strategy = None
     if getattr(args, "regime_filter", False):
-        regime_strategy = RegimeFilteredStrategy(strategy)
+        regime_strategy = RegimeFilteredStrategy(strategy, regime_timeframe=getattr(args, "regime_timeframe", None))
         strategy = regime_strategy
+        need = regime_strategy.required_bars(args.timeframe)
+        if need > MAX_BACKFILL_BARS:
+            raise SystemExit(f"--regime-timeframe {args.regime_timeframe} butuh {need} candle {args.timeframe} "
+                             f"untuk pemanasan -- melebihi batas {MAX_BACKFILL_BARS}. Pakai timeframe regime "
+                             f"yang lebih kecil, atau timeframe bot yang lebih besar.")
+        if (args.backfill_bars or 0) < need:
+            print(f"  (Backfill dinaikkan {args.backfill_bars or 0} -> {need} candle supaya regime "
+                  f"{args.regime_timeframe or args.timeframe} langsung siap, tidak menunggu berjam-jam)")
+            args.backfill_bars = need
+        print(f"  (Filter regime: dihitung di timeframe {args.regime_timeframe or args.timeframe}, "
+              f"dari candle yang sudah close)")
     print(f"  (Strategi: {strategy.describe()})")
     print(f"  (ALLOWS_SHORT={strategy.ALLOWS_SHORT} -- wajib True untuk futures selalu-di-pasar ini)")
 
@@ -264,6 +313,11 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
         print(f"   Setelah TP: {'BERHENTI TOTAL' if args.stop_after_take_profit else tahan}. "
               f"Setelah SL: {tahan}.)")
 
+    if regime_strategy is not None and (args.backfill_bars or 0) > BINANCE_KLINE_LIMIT \
+            and hasattr(broker, "exchange"):
+        from src.strategy.regime_filtered import tf_minutes
+        install_paged_backfill(broker, tf_minutes(args.timeframe))
+
     return PaperRunner(
         strategy, broker, symbol=args.symbol, timeframe=args.timeframe,
         order_amount=args.amount, use_reduce_only=True,  # futures -- reduceOnly relevan, beda dari spot
@@ -271,7 +325,7 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
         take_profit_pct=args.take_profit_pct, stop_after_take_profit=args.stop_after_take_profit,
         backfill_bars=args.backfill_bars, live_take_profit_poll_seconds=args.live_take_profit_poll_seconds,
         debug_info_fn=make_debug_fn(args.lookback, regime_strategy),
-        buffer_size=REGIME_BUFFER_BARS if regime_strategy is not None else 500,
+        buffer_size=max(REGIME_BUFFER_BARS, (args.backfill_bars or 0) + 1000) if regime_strategy is not None else 500,
         risk_reward=args.risk_reward, sl_atr_mult=args.sl_atr_mult, sl_atr_period=args.sl_atr_period,
         sl_min_fee_mult=args.sl_min_fee_mult, bracket_poll_seconds=args.bracket_poll_seconds,
         reentry_mode=reentry_mode,
@@ -335,6 +389,10 @@ def main() -> None:
     p.add_argument("--tp-sl-price-pct", action="store_true",
                     help="artikan --tp-roi-pct/--sl-roi-pct sebagai %% PERGERAKAN HARGA (= %% dari nilai "
                          "posisi), bukan ROI terhadap margin. Mis. --tp-roi-pct 5 = harga +5%%.")
+    p.add_argument("--regime-timeframe", default=None,
+                    help="hitung filter regime di timeframe LEBIH BESAR dari timeframe bot, format bebas "
+                         "<angka>m atau <angka>h (mis. 5m, 10m, 15m, 30m, 1h, 2h). Harus kelipatan "
+                         "timeframe bot. Default: sama dengan timeframe bot.")
     p.add_argument("--leverage", type=int, default=None,
                     help="set leverage simbol ini di Binance sebelum bot mulai (mis. 1 = tanpa leverage). "
                          "Tanpa ini, bot memakai leverage yang sedang terpasang di Binance.")
@@ -382,6 +440,22 @@ def main() -> None:
         if args.live_take_profit_poll_seconds is not None:
             print("  (Catatan: --live-take-profit-poll-seconds tidak berpengaruh di mode --risk-reward; "
                   "SL/TP dieksekusi bursa.)")
+
+    if args.regime_timeframe is not None:
+        from src.strategy.regime_filtered import tf_minutes
+        if not args.regime_filter:
+            raise SystemExit("--regime-timeframe hanya berlaku bersama --regime-filter.")
+        try:
+            reg_min, bot_min = tf_minutes(args.regime_timeframe), tf_minutes(args.timeframe)
+        except ValueError as e:
+            raise SystemExit(f"--regime-timeframe: {e}")
+        if reg_min <= bot_min:
+            raise SystemExit(f"--regime-timeframe ({args.regime_timeframe}) harus LEBIH BESAR dari "
+                             f"--timeframe ({args.timeframe}).")
+        if reg_min % bot_min:
+            raise SystemExit(f"--regime-timeframe ({args.regime_timeframe}) harus KELIPATAN --timeframe "
+                             f"({args.timeframe}), mis. 5m/15m/1h untuk bot 1m.")
+        args.regime_timeframe = args.regime_timeframe.strip().lower()
 
     if args.lookback < 100:
         print(f"\nPERINGATAN: lookback={args.lookback} jauh di bawah plateau tervalidasi (148-328).")
