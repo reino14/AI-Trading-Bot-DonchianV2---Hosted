@@ -39,18 +39,29 @@ from src.strategy.regime_detector import RegimeConfig, detect_regime, regime_fro
 
 import re
 
-_TF_RE = re.compile(r"^(\d+)([mh])$")
+_TF_RE = re.compile(r"^(\d+)([mhdwM])$")
+_UNIT_MIN = {"m": 1, "h": 60, "d": 1440, "w": 10080}
+
+
+def normalize_tf(tf: str) -> str:
+    """'1H' -> '1h', '1D' -> '1d', '1W' -> '1w'. '1M' tetap = 1 bulan (beda dari '1m' = 1 menit)."""
+    tf = str(tf).strip()
+    if tf and tf[-1] in "HDW":
+        tf = tf[:-1] + tf[-1].lower()
+    return tf
 
 #: jumlah candle timeframe-regime minimal supaya EMA50/ADX14 + konfirmasi stabil
 REGIME_WARMUP_HTF_BARS = 70
 
 
 def tf_minutes(tf: str) -> int:
-    """'5m' -> 5, '2h' -> 120. Format bebas: <angka>m atau <angka>h."""
-    m = _TF_RE.match(str(tf).strip().lower())
+    """'5m' -> 5, '2h' -> 120, '1d' -> 1440, '1w' -> 10080 (format timeframe Binance)."""
+    m = _TF_RE.match(normalize_tf(tf))
     if not m or int(m.group(1)) <= 0:
-        raise ValueError(f"timeframe tidak valid: {tf!r} -- pakai format seperti 5m, 15m, 1h, 4h")
-    return int(m.group(1)) * (60 if m.group(2) == "h" else 1)
+        raise ValueError(f"timeframe tidak valid: {tf!r} -- pakai format seperti 5m, 15m, 1h, 4h, 1d, 1w")
+    if m.group(2) == "M":
+        raise ValueError("timeframe bulanan (1M) tidak didukung untuk regime -- panjang bulan tidak tetap")
+    return int(m.group(1)) * _UNIT_MIN[m.group(2)]
 
 
 def tf_rule(tf: str) -> str:
@@ -81,7 +92,7 @@ class RegimeFilteredStrategy(Strategy):
         self.cfg = cfg or RegimeConfig()
         self.ALLOWS_SHORT = inner.ALLOWS_SHORT
         if regime_timeframe is not None:
-            regime_timeframe = str(regime_timeframe).strip().lower()
+            regime_timeframe = normalize_tf(regime_timeframe)
             tf_minutes(regime_timeframe)  # validasi format
         self.regime_timeframe = regime_timeframe
 

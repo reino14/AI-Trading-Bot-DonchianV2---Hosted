@@ -764,6 +764,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
   button:disabled { opacity:.45; cursor:not-allowed; }
   .baris { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:14px; }
   .cek { display:flex; align-items:center; gap:7px; font-size:13px; }
+  .grup-wrap { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr)); gap:14px; }
+  .grup { border:1px solid var(--line); border-radius:10px; padding:14px 16px; background:var(--bg); }
+  .grup-judul { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.06em;
+                color:var(--muted); margin-bottom:12px; }
+  .grup .form { grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }
+  .f.lebar { grid-column:1 / -1; }
+  .grup .form.dua { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .ket { font-size:11px; color:var(--muted); margin-top:5px; line-height:1.5; }
+  .ket.merah-t { color:var(--merah); }
+  .ket-blok { font-size:12px; color:var(--muted); line-height:1.6; margin-top:12px;
+              padding-top:12px; border-top:1px dashed var(--line); }
+  .aksi { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:16px;
+          padding-top:16px; border-top:1px solid var(--line); }
+  .cmd { margin-top:10px; word-break:break-all; }
+  .cek input { width:16px; height:16px; margin:0; }
   pre.log { margin:0; padding:14px; background:#0b0d11; color:#d4d4d4; border-radius:8px;
             font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11.5px; line-height:1.55;
             max-height:340px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
@@ -785,40 +800,67 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   <h2>Jalankan bot</h2>
   <div class="panel">
-    <div class="form">
-      <div class="f"><label>Simbol</label><input id="c_symbol" value="BTC/USDT:USDT"></div>
-      <div class="f"><label>Timeframe</label>
-        <select id="c_timeframe" onchange="cekRegimeTf()"><option>1m</option><option>5m</option><option>15m</option><option>1h</option><option>4h</option></select></div>
-      <div class="f"><label>Lookback (bar)</label><input id="c_lookback" type="number" value="200"></div>
-      <div class="f"><label>Amount (BTC)</label><input id="c_amount" type="number" step="0.001" value="0.001" oninput="hitungNotional()">
-        <div class="sub" id="ket_amount" style="font-size:11px;margin-top:5px;line-height:1.5">&mdash;</div></div>
-      <div class="f"><label>Session (jam)</label><input id="c_session" type="number" step="0.5" value="24"></div>
-      <div class="f"><label>Take profit (% dari posisi)</label><input id="c_tp_roi" type="number" step="0.05" min="0" value="0.5" oninput="hitungNotional()"></div>
-      <div class="f"><label>Stop loss (% dari posisi)</label><input id="c_sl_roi" type="number" step="0.05" min="0" value="0.25" oninput="hitungNotional()"></div>
-      <div class="f"><label>Backfill (bar)</label><input id="c_backfill" type="number" value="200"></div>
-      <div class="f"><label>Leverage (x)</label><input id="c_leverage" type="number" min="1" max="125" step="1" value="1" oninput="hitungNotional()"></div>
+    <div class="grup-wrap">
+      <section class="grup">
+        <div class="grup-judul">Pasar &amp; strategi</div>
+        <div class="form dua">
+          <div class="f lebar"><label for="c_symbol">Simbol</label><input id="c_symbol" value="BTC/USDT:USDT"></div>
+          <div class="f"><label for="c_timeframe">Timeframe bot</label>
+            <select id="c_timeframe" onchange="isiOpsiRegime()">
+              <option value="1m" selected>1m</option><option value="3m">3m</option><option value="5m">5m</option>
+              <option value="15m">15m</option><option value="30m">30m</option><option value="1h">1H</option>
+              <option value="2h">2H</option><option value="4h">4H</option><option value="6h">6H</option>
+              <option value="8h">8H</option><option value="12h">12H</option><option value="1d">1D</option>
+            </select></div>
+          <div class="f"><label for="c_lookback">Lookback (bar)</label><input id="c_lookback" type="number" value="200"></div>
+          <div class="f"><label for="c_backfill">Backfill (bar)</label><input id="c_backfill" type="number" value="200"></div>
+          <div class="f"><label for="c_session">Sesi (jam)</label><input id="c_session" type="number" step="0.5" value="24"></div>
+        </div>
+      </section>
+
+      <section class="grup">
+        <div class="grup-judul">Posisi &amp; risiko</div>
+        <div class="form dua">
+          <div class="f"><label for="c_amount">Amount (BTC)</label><input id="c_amount" type="number" step="0.0001" value="0.0012" oninput="hitungNotional()">
+            <div class="ket" id="ket_amount">&mdash;</div></div>
+          <div class="f"><label for="c_leverage">Leverage (x)</label><input id="c_leverage" type="number" min="1" max="125" step="1" value="1" oninput="hitungNotional()"></div>
+          <div class="f"><label for="c_tp_roi">Take profit (% posisi)</label><input id="c_tp_roi" type="number" step="0.05" min="0" value="0.5" oninput="hitungNotional()"></div>
+          <div class="f"><label for="c_sl_roi">Stop loss (% posisi)</label><input id="c_sl_roi" type="number" step="0.05" min="0" value="0.25" oninput="hitungNotional()"></div>
+        </div>
+        <div class="ket-blok" id="ket_rr">&mdash;</div>
+      </section>
+
+      <section class="grup">
+        <div class="grup-judul">Filter regime</div>
+        <label class="cek"><input type="checkbox" id="c_regime" onchange="isiOpsiRegime()"> Entry hanya saat trend searah</label>
+        <div class="form" style="margin-top:10px">
+          <div class="f lebar"><label for="c_regime_tf">Regime dibaca di timeframe</label>
+            <select id="c_regime_tf" onchange="cekRegimeTf()"></select>
+            <div class="ket" id="ket_regime_tf">&mdash;</div></div>
+        </div>
+      </section>
+
+      <section class="grup">
+        <div class="grup-judul">Perilaku</div>
+        <div class="form">
+          <div class="f lebar"><label for="c_mode_tp">Setelah take profit</label>
+            <select id="c_mode_tp" onchange="ketModeTp()">
+              <option value="sekali" selected>Sekali saja &mdash; bot berhenti</option>
+              <option value="tengah">Berulang &mdash; masuk lagi dari tengah channel</option>
+              <option value="berulang">Berulang &mdash; tunggu sinyal berbalik</option>
+            </select>
+            <div class="ket" id="ket_mode_tp"></div></div>
+        </div>
+        <label class="cek" style="margin-top:12px"><input type="checkbox" id="c_close_stop" checked> Tutup posisi saat bot dihentikan</label>
+      </section>
     </div>
-    <div class="sub" id="ket_rr" style="font-size:12px;margin-top:10px;line-height:1.55">&mdash;</div>
-    <div class="baris">
-      <label class="cek">Setelah take profit:
-        <select id="c_mode_tp" onchange="ketModeTp()" style="padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--fg);font-size:13px;font-family:inherit">
-          <option value="sekali" selected>Sekali saja &mdash; bot berhenti</option>
-          <option value="tengah">Berulang &mdash; masuk lagi dari tengah channel</option>
-          <option value="berulang">Berulang &mdash; tunggu sinyal berbalik</option>
-        </select></label>
-      <span class="sub" id="ket_mode_tp" style="font-size:11px"></span>
-      <label class="cek"><input type="checkbox" id="c_regime"> Filter regime (entry hanya saat trend)</label>
-      <label class="cek">Regime dibaca di:
-        <input id="c_regime_tf" list="daftar_regime_tf" value="15m" placeholder="kosong = sama dengan bot"
-          oninput="cekRegimeTf()" style="width:150px;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--fg);font-size:13px;font-family:inherit">
-        <datalist id="daftar_regime_tf"><option value="5m"><option value="15m"><option value="30m"><option value="1h"><option value="4h"></datalist></label>
-      <span class="sub" id="ket_regime_tf" style="font-size:11px"></span>
-      <label class="cek"><input type="checkbox" id="c_close_stop" checked> Tutup posisi saat bot dihentikan</label>
+
+    <div class="aksi">
       <button class="pri" id="btn_start" onclick="mulai()">Mulai bot</button>
-      <button class="bahaya" id="btn_stop" onclick="hentikan()">Hentikan (ala Ctrl+C)</button>
+      <button class="bahaya" id="btn_stop" onclick="hentikan()">Hentikan</button>
       <span id="pesan" class="sub"></span>
     </div>
-    <div class="sub mono" id="cmd_preview" style="margin-top:12px"></div>
+    <div class="sub mono cmd" id="cmd_preview"></div>
   </div>
 
   <div id="isi"></div>
@@ -842,30 +884,53 @@ function konfig() {
     backfill_bars: +pilih("c_backfill").value || null,
     leverage: Math.max(1, Math.round(+pilih("c_leverage").value || 1)),
     regime_filter: pilih("c_regime").checked,
-    regime_timeframe: pilih("c_regime_tf").value.trim().toLowerCase() || null,
+    regime_timeframe: pilih("c_regime_tf").value || null,
     close_on_stop: pilih("c_close_stop").checked,
   };
 }
 
-// Format timeframe regime: <angka>m atau <angka>h, lebih besar dari &
-// kelipatan timeframe bot. Kosong = regime dibaca di timeframe bot.
+// Timeframe regime -- daftar sama dengan pilihan interval Binance.
+// Opsi yang tidak bisa dipakai untuk timeframe bot saat ini DIMATIKAN
+// dengan alasannya, bukan disembunyikan.
+const TF_REGIME = [["1m","1m"],["3m","3m"],["5m","5m"],["15m","15m"],["30m","30m"],["1h","1H"],
+  ["2h","2H"],["4h","4H"],["6h","6H"],["8h","8H"],["12h","12H"],["1d","1D"],["1w","1W"],["1M","1M"]];
+const MAKS_PEMANASAN = 12000, PEMANASAN_HTF = 70;
 function menitTf(tf) {
-  const m = /^(\d+)([mh])$/.exec(String(tf).trim().toLowerCase());
-  return m && +m[1] > 0 ? +m[1] * (m[2] === "h" ? 60 : 1) : null;
+  const m = /^(\d+)([mhdwM])$/.exec(String(tf).trim());
+  if (!m || +m[1] <= 0 || m[2] === "M") return null;
+  return +m[1] * {m:1, h:60, d:1440, w:10080}[m[2]];
+}
+function alasanTf(tf) {
+  if (tf === "1M") return "bulanan tidak didukung";
+  const r = menitTf(tf), b = menitTf(pilih("c_timeframe").value);
+  if (r <= b) return "tidak lebih besar dari timeframe bot";
+  if (r % b) return "bukan kelipatan timeframe bot";
+  const warm = PEMANASAN_HTF * r / b;
+  if (warm > MAKS_PEMANASAN) return `butuh ${warm.toLocaleString("id-ID")} candle, maks ${MAKS_PEMANASAN.toLocaleString("id-ID")}`;
+  return null;
+}
+function isiOpsiRegime() {
+  const el = pilih("c_regime_tf"), lama = el.value || "15m";
+  el.innerHTML = `<option value="">Sama dengan timeframe bot</option>` + TF_REGIME.map(([v, l]) => {
+    const a = alasanTf(v);
+    return `<option value="${v}"${a ? " disabled" : ""}>${l}${a ? " \u2014 " + a : ""}</option>`;
+  }).join("");
+  const opsiLama = [...el.options].find(o => o.value === lama && !o.disabled);
+  el.value = opsiLama ? lama : "";
+  el.disabled = !pilih("c_regime").checked;
+  cekRegimeTf();
 }
 function cekRegimeTf() {
-  const el = pilih("ket_regime_tf"), v = pilih("c_regime_tf").value.trim();
-  if (!v) { el.textContent = "regime dibaca di timeframe bot"; el.className = "sub"; return true; }
-  const r = menitTf(v), b = menitTf(pilih("c_timeframe").value);
-  let salah = null;
-  if (r === null) salah = "format salah -- contoh: 5m, 15m, 1h";
-  else if (b !== null && r <= b) salah = "harus lebih besar dari timeframe bot";
-  else if (b !== null && r % b) salah = "harus kelipatan timeframe bot";
-  if (salah) { el.textContent = salah; el.className = "merah-t"; return false; }
-  const warm = 70 * (r / b);
-  el.textContent = `pemanasan ${warm} candle ${pilih("c_timeframe").value}` + (warm > 12000 ? " -- terlalu banyak (maks 12000)" : "");
-  el.className = warm > 12000 ? "merah-t" : "sub";
-  return warm <= 12000;
+  const ket = pilih("ket_regime_tf"), v = pilih("c_regime_tf").value, bot = pilih("c_timeframe").value;
+  ket.className = "ket";
+  if (!pilih("c_regime").checked) { ket.textContent = "Filter mati \u2014 entry tidak disaring regime."; return true; }
+  if (!v) { ket.textContent = `Regime dibaca di ${bot}, sama dengan bot.`; return true; }
+  const a = alasanTf(v);
+  if (a) { ket.textContent = a; ket.className = "ket merah-t"; return false; }
+  const warm = PEMANASAN_HTF * menitTf(v) / menitTf(bot);
+  ket.textContent = `Pemanasan ${warm.toLocaleString("id-ID")} candle ${bot}` +
+    (warm > 1500 ? " \u2014 diambil bertahap dari Binance." : ".");
+  return true;
 }
 
 async function mulai() {
@@ -1489,7 +1554,7 @@ async function muat() {
 }
 muat();
 setInterval(muat, 5000);
-cekRegimeTf();
+isiOpsiRegime();
 </script>
 </body>
 </html>

@@ -129,7 +129,10 @@ def resample_ohlcv(df: pd.DataFrame, rule: str = "15min") -> pd.DataFrame:
     agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
     if "volume" in df:
         agg["volume"] = "sum"
-    return df.resample(rule).agg(agg).dropna()
+    # Origin Senin 1970-01-05 00:00 UTC: candle harian sejajar 00:00 UTC dan
+    # candle mingguan mulai Senin -- sama dengan pembagian candle Binance.
+    origin = pd.Timestamp("1970-01-05", tz=df.index.tz) if df.index.tz is not None else pd.Timestamp("1970-01-05")
+    return df.resample(rule, origin=origin).agg(agg).dropna()
 
 
 def regime_from_higher_tf(df_ltf: pd.DataFrame, rule: str = "15min",

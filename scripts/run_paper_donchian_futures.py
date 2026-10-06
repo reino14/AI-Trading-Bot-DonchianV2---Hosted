@@ -390,8 +390,8 @@ def main() -> None:
                     help="artikan --tp-roi-pct/--sl-roi-pct sebagai %% PERGERAKAN HARGA (= %% dari nilai "
                          "posisi), bukan ROI terhadap margin. Mis. --tp-roi-pct 5 = harga +5%%.")
     p.add_argument("--regime-timeframe", default=None,
-                    help="hitung filter regime di timeframe LEBIH BESAR dari timeframe bot, format bebas "
-                         "<angka>m atau <angka>h (mis. 5m, 10m, 15m, 30m, 1h, 2h). Harus kelipatan "
+                    help="hitung filter regime di timeframe LEBIH BESAR dari timeframe bot, format timeframe "
+                         "Binance (mis. 3m, 5m, 15m, 30m, 1h, 2h, 4h, 1d, 1w). Harus kelipatan "
                          "timeframe bot. Default: sama dengan timeframe bot.")
     p.add_argument("--leverage", type=int, default=None,
                     help="set leverage simbol ini di Binance sebelum bot mulai (mis. 1 = tanpa leverage). "
@@ -455,7 +455,8 @@ def main() -> None:
         if reg_min % bot_min:
             raise SystemExit(f"--regime-timeframe ({args.regime_timeframe}) harus KELIPATAN --timeframe "
                              f"({args.timeframe}), mis. 5m/15m/1h untuk bot 1m.")
-        args.regime_timeframe = args.regime_timeframe.strip().lower()
+        from src.strategy.regime_filtered import normalize_tf
+        args.regime_timeframe = normalize_tf(args.regime_timeframe)
 
     if args.lookback < 100:
         print(f"\nPERINGATAN: lookback={args.lookback} jauh di bawah plateau tervalidasi (148-328).")
